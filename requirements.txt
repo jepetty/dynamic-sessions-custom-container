@@ -7,3 +7,4 @@ azure-mgmt-containerinstance
 azure-mgmt-resource
 requests
 aiohttp
+PyJWT[crypto]
