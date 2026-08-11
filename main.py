@@ -341,13 +341,11 @@ def execute_in_dynamic_session(
         print(f"🔗 Session URL: {session_url}")
         print(f"📋 Payload: {execution_payload}")
         try:
-            print(f"🚀 Making request to: {session_url}")
-            print(f"📋 Headers: {headers}")
+            print(f"🚀 Making authenticated request to: {session_url}")
             print(f"📦 Payload: {execution_payload}")
             
             response = requests.post(session_url, json=execution_payload, headers=headers, timeout=60)
             print(f"📊 Response Status: {response.status_code}")
-            print(f"📝 Response Headers: {dict(response.headers)}")
             print(f"📝 Response Body: {response.text}")
         except requests.exceptions.RequestException as req_error:
             print(f"❌ Request failed: {req_error}")
