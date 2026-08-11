@@ -4,7 +4,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --index-url https://packagefeedproxy.microsoft.io/pypi/simple/ -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
