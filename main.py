@@ -2,37 +2,25 @@ import os
 import asyncio
 import json
 import random
+import secrets
 import uuid
 import time
 import base64
 import threading
 import queue
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, Response, stream_with_context
+from contextvars import ContextVar
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context, g
 from flask_restx import Api, Resource, fields, Namespace
-from agent_framework import ChatAgent, AgentThread
-try:
-    from agent_framework import ai_function
-except ImportError:
-    try:
-        from agent_framework.tools import ai_function
-    except ImportError:
-        try:
-            from agent_framework.decorators import ai_function
-        except ImportError:
-            try:
-                from agent_framework import tool as ai_function
-            except ImportError:
-                def ai_function(func=None, **_kwargs):
-                    def decorator(f):
-                        return f
-                    return decorator(func) if func else decorator
-from agent_framework.azure import AzureOpenAIChatClient
+from agent_framework import Agent, AgentSession
+from agent_framework import tool as ai_function
+from agent_framework.openai import OpenAIChatClient
 from azure.identity import DefaultAzureCredential
 from typing import Annotated, List, Dict, Any, Optional
 from pydantic import Field
 import requests
 import aiohttp
+import jwt
+from jwt import InvalidTokenError
 
 app = Flask(__name__)
 
@@ -63,19 +51,16 @@ tools_ns = api.namespace('tools', description='AI tool management and discovery'
 
 # Define API models for request/response schemas
 chat_request_model = api.model('ChatRequest', {
-    'prompt': fields.String(required=True, description='The user message or question', example='Execute print("Hello World")'),
-    'session_id': fields.String(required=False, description='Session identifier for conversation continuity', example='user_123')
+    'prompt': fields.String(required=True, description='The user message or question', example='Execute print("Hello World")')
 })
 
 chat_response_model = api.model('ChatResponse', {
     'response': fields.String(required=True, description='AI agent response'),
-    'session_id': fields.String(required=True, description='Session identifier'),
     'agent': fields.String(required=True, description='Agent framework name'),
     'model': fields.String(required=True, description='AI model used'),
     'tools_used': fields.List(fields.Raw, description='List of tools that were used'),
     'tools_available': fields.List(fields.String, description='Available tools'),
-    'conversation_length': fields.Integer(description='Number of messages in conversation'),
-    'active_sessions': fields.Raw(description='Active dynamic sessions with execution details')
+    'conversation_length': fields.Integer(description='Number of messages in conversation')
 })
 
 health_response_model = api.model('HealthResponse', {
@@ -85,8 +70,6 @@ health_response_model = api.model('HealthResponse', {
     'endpoint': fields.String(description='Azure OpenAI endpoint'),
     'model': fields.String(description='AI model deployment'),
     'tools_count': fields.Integer(description='Number of available tools'),
-    'active_sessions': fields.Integer(description='Number of active chat sessions'),
-    'dynamic_sessions': fields.Integer(description='Number of active dynamic sessions'),
     'session_pool_configured': fields.Boolean(description='Whether Azure Container Apps session pool is configured'),
     'azure_configured': fields.Boolean(description='Whether Azure OpenAI is properly configured')
 })
@@ -120,19 +103,200 @@ SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")
 RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP")
 SESSION_POOL_NAME = os.getenv("AZURE_SESSION_POOL_NAME", "dynamic-session-pool")
 SESSION_POOL_AUDIENCE = os.getenv("SESSION_POOL_AUDIENCE", "https://dynamicsessions.io/.default")
+SESSION_COOKIE_NAME = "aca_sample_session"
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+SESSION_COOKIE_MAX_AGE_SECONDS = int(os.getenv("SESSION_COOKIE_MAX_AGE_SECONDS", "1800"))
+MAX_CONVERSATION_THREADS = int(os.getenv("MAX_CONVERSATION_THREADS", "100"))
+SESSION_SIGNING_KEY = os.getenv("SESSION_SIGNING_KEY") or secrets.token_hex(32)
+
+# Chat endpoint authentication settings
+ALLOW_UNAUTHENTICATED_CHAT = os.getenv("ALLOW_UNAUTHENTICATED_CHAT", "false").lower() in ("1", "true", "yes")
+TRUST_EASYAUTH_HEADERS = os.getenv("TRUST_EASYAUTH_HEADERS", "false").lower() in ("1", "true", "yes")
+CHAT_AUTH_TENANT_ID = os.getenv("CHAT_AUTH_TENANT_ID") or os.getenv("AZURE_TENANT_ID", "")
+CHAT_AUTH_AUDIENCE = os.getenv("CHAT_AUTH_AUDIENCE", "")
+CHAT_AUTH_CLIENT_ID = os.getenv("CHAT_AUTH_CLIENT_ID", "")
+CHAT_AUTH_SCOPE = os.getenv("CHAT_AUTH_SCOPE", f"{CHAT_AUTH_AUDIENCE}/access_as_user" if CHAT_AUTH_AUDIENCE else "")
+
+_entra_jwks_clients: Dict[str, Any] = {}
 
 # Session management storage
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
-# Track which session IDs have been used in current request to avoid duplicates
-current_request_sessions: set = set()
+
+def _get_request_tools() -> List[Dict[str, Any]]:
+    tools = request_tools_used.get()
+    if tools is None:
+        tools = []
+        request_tools_used.set(tools)
+    return tools
+
+
+def _decode_session_cookie(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        session_id = session_serializer.loads(
+            value,
+            max_age=SESSION_COOKIE_MAX_AGE_SECONDS,
+        )
+    except (BadSignature, SignatureExpired):
+        return None
+    if not isinstance(session_id, str) or len(session_id) != 32:
+        return None
+    return session_id
+
+
+def _cleanup_conversation_threads(now: float) -> None:
+    expired_before = now - SESSION_COOKIE_MAX_AGE_SECONDS
+    expired_ids = [
+        session_id
+        for session_id, state in conversation_threads.items()
+        if state["last_used"] < expired_before
+    ]
+    for session_id in expired_ids:
+        conversation_threads.pop(session_id, None)
+
+    overflow = len(conversation_threads) - MAX_CONVERSATION_THREADS
+    if overflow > 0:
+        oldest_ids = sorted(
+            conversation_threads,
+            key=lambda session_id: conversation_threads[session_id]["last_used"],
+        )[:overflow]
+        for session_id in oldest_ids:
+            conversation_threads.pop(session_id, None)
+
+
+def _get_conversation_thread(session_id: str):
+    now = time.monotonic()
+    with conversation_threads_lock:
+        _cleanup_conversation_threads(now)
+        state = conversation_threads.get(session_id)
+        if state is None:
+            state = {
+                "thread": agent.get_new_thread(),
+                "last_used": now,
+            }
+            conversation_threads[session_id] = state
+            _cleanup_conversation_threads(now)
+        else:
+            state["last_used"] = now
+        return state["thread"]
+
+
+@app.before_request
+def assign_client_session() -> None:
+    session_id = _decode_session_cookie(request.cookies.get(SESSION_COOKIE_NAME))
+    if session_id is None:
+        session_id = uuid.uuid4().hex
+        g.set_session_cookie = True
+    g.client_session_id = session_id
+
+
+@app.after_request
+def persist_client_session(response):
+    if getattr(g, "clear_session_cookie", False):
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    elif getattr(g, "set_session_cookie", False):
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            session_serializer.dumps(g.client_session_id),
+            httponly=True,
+            secure=SESSION_COOKIE_SECURE,
+            samesite="Lax",
+            max_age=SESSION_COOKIE_MAX_AGE_SECONDS,
+            path="/",
+        )
+    return response
+
+
+def _extract_bearer_token(auth_header: str) -> str:
+    if not auth_header:
+        return ""
+    parts = auth_header.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return ""
+    return parts[1].strip()
+
+
+def _get_entra_jwks_client(tenant_id: str) -> Any:
+    if tenant_id not in _entra_jwks_clients:
+        jwks_url = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
+        _entra_jwks_clients[tenant_id] = jwt.PyJWKClient(jwks_url)
+    return _entra_jwks_clients[tenant_id]
+
+
+def _has_valid_entra_bearer_token() -> bool:
+    if not CHAT_AUTH_TENANT_ID or not CHAT_AUTH_AUDIENCE:
+        return False
+
+    presented_token = _extract_bearer_token(request.headers.get("Authorization", ""))
+    if not presented_token:
+        return False
+
+    try:
+        jwks_client = _get_entra_jwks_client(CHAT_AUTH_TENANT_ID)
+        signing_key = jwks_client.get_signing_key_from_jwt(presented_token).key
+        expected_audiences = [CHAT_AUTH_AUDIENCE]
+        if CHAT_AUTH_CLIENT_ID and CHAT_AUTH_CLIENT_ID not in expected_audiences:
+            expected_audiences.append(CHAT_AUTH_CLIENT_ID)
+
+        claims = jwt.decode(
+            presented_token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=expected_audiences,
+            options={"require": ["iss", "aud", "exp"]}
+        )
+
+        valid_issuers = {
+            f"https://login.microsoftonline.com/{CHAT_AUTH_TENANT_ID}/v2.0",
+            f"https://sts.windows.net/{CHAT_AUTH_TENANT_ID}/"
+        }
+        if claims.get("iss") not in valid_issuers:
+            return False
+
+        # Require a caller identity claim so only authenticated principals are accepted.
+        return bool(claims.get("oid") or claims.get("sub"))
+    except InvalidTokenError as token_error:
+        print(f"❌ Chat auth token validation failed: {token_error}")
+        return False
+    except Exception as auth_error:
+        print(f"❌ Chat auth processing error: {auth_error}")
+        return False
+
+
+def _has_trusted_easyauth_identity() -> bool:
+    if not TRUST_EASYAUTH_HEADERS:
+        return False
+
+    principal_id = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID", "")
+    principal_provider = request.headers.get("X-MS-CLIENT-PRINCIPAL-IDP", "")
+    return bool(principal_id) and principal_provider.lower() in ("aad", "entra")
+
+
+def _is_authenticated_chat_request() -> bool:
+    if ALLOW_UNAUTHENTICATED_CHAT:
+        return True
+    if _has_valid_entra_bearer_token():
+        return True
+    if _has_trusted_easyauth_identity():
+        return True
+    return False
+
+
+@app.before_request
+def require_auth_for_chat_endpoints():
+    if request.path.startswith("/api/chat") and not _is_authenticated_chat_request():
+        return jsonify({
+            "error": "Authentication required for chat endpoints",
+            "details": "Provide a valid Microsoft Entra Bearer token for CHAT_AUTH_AUDIENCE, or configure trusted platform authentication."
+        }), 401
 
 # Enhanced AI functions (tools) for the agent
 @ai_function
 def search_tools_available() -> str:
     """List all available tools and their capabilities."""
-    global current_tools_used
-    current_tools_used.append({"name": "search_tools_available", "icon": "🔧", "description": "Tool discovery"})
+    _get_request_tools().append({"name": "search_tools_available", "icon": "🔧", "description": "Tool discovery"})
     print("🔧 TOOL CALLED: search_tools_available()")
     
     tools_info = """Available AI Tools:
@@ -163,7 +327,7 @@ def execute_in_dynamic_session(
     - execute_in_dynamic_session(code="print('hello world')")
     - execute_in_dynamic_session(code="x = 5\\nprint(x * 2)")
     """
-    # Always use Python and reuse existing sessions when available
+    # Always use Python and isolate execution state by the current client session.
     
     # Write debug info to file to see if function is called
     import os
@@ -175,26 +339,15 @@ def execute_in_dynamic_session(
         pass  # Ignore file write errors
     
     try:
-        # Reuse existing session if available, otherwise create new one
-        session_id = None
-        if active_sessions:
-            session_id = list(active_sessions.keys())[-1]
-            print(f"📦 Reusing existing session: {session_id}")
-        else:
-            session_id = uuid.uuid4().hex[:12]
-            print(f"📦 Creating new session: {session_id}")
-        
-        global current_tools_used, current_request_sessions
-        
-        # Only track if this session hasn't been used in current request
-        if session_id not in current_request_sessions:
-            current_tools_used.append({
-                "name": "execute_in_dynamic_session", 
-                "icon": "📦", 
-                "description": "Python Execution", 
-                "session_id": session_id
-            })
-            current_request_sessions.add(session_id)
+        session_id = current_session_id.get()
+        if not session_id:
+            return "Session error: No request session is available."
+
+        _get_request_tools().append({
+            "name": "execute_in_dynamic_session",
+            "icon": "📦",
+            "description": "Python Execution",
+        })
         print(f"📦 TOOL CALLED: execute_in_dynamic_session()")
         print(f"🔍 SESSION_POOL_ENDPOINT: {SESSION_POOL_ENDPOINT}")
         
@@ -256,17 +409,14 @@ def execute_in_dynamic_session(
         
         # Execute request
         
-        print(f"📦 Executing Python code in session {session_id[:8]}...")
-        print(f"🔗 Session URL: {session_url}")
+        print("📦 Executing Python code in the current client session...")
         print(f"📋 Payload: {execution_payload}")
         try:
-            print(f"🚀 Making request to: {session_url}")
-            print(f"📋 Headers: {headers}")
+            print(f"🚀 Making authenticated request to: {session_url}")
             print(f"📦 Payload: {execution_payload}")
             
             response = requests.post(session_url, json=execution_payload, headers=headers, timeout=60)
             print(f"📊 Response Status: {response.status_code}")
-            print(f"📝 Response Headers: {dict(response.headers)}")
             print(f"📝 Response Body: {response.text}")
         except requests.exceptions.RequestException as req_error:
             print(f"❌ Request failed: {req_error}")
@@ -277,23 +427,10 @@ def execute_in_dynamic_session(
             print(f"📊 DEBUG: Full response from session container: {result}")
             print(f"📊 DEBUG: Full response JSON: {json.dumps(result, indent=2)}")
             
-            # Track auto-allocated session
-            if session_id not in active_sessions:
-                active_sessions[session_id] = {
-                    "created_at": datetime.now().isoformat(),
-                    "execution_count": 0,
-                    "last_stdout": "",
-                    "last_stderr": ""
-                }
-                print(f"✅ Session auto-allocated: {session_id}")
-            
-            # Update session statistics
-            active_sessions[session_id]["execution_count"] += 1
-            active_sessions[session_id]["last_used"] = datetime.now().isoformat()
-            
-            # Debug logging
-            print(f"📊 DEBUG: active_sessions dict has {len(active_sessions)} entries")
-            print(f"📊 DEBUG: active_sessions = {active_sessions}")
+            execution_state = {
+                "last_stdout": "",
+                "last_stderr": "",
+            }
             
             # Extract execution result and capture stdout/stderr
             # Handle both formats: properties-based (Azure) and direct fields (our container)
@@ -309,9 +446,9 @@ def execute_in_dynamic_session(
                 status = props.get("status", "")
                 return_code = props.get("returnCode", None)
                 
-                active_sessions[session_id]["last_stdout"] = stdout
-                active_sessions[session_id]["last_stderr"] = stderr
-                active_sessions[session_id]["last_returnCode"] = return_code
+                execution_state["last_stdout"] = stdout
+                execution_state["last_stderr"] = stderr
+                execution_state["last_returnCode"] = return_code
                 
                 # Determine if execution failed based on multiple signals
                 # Check for error indicators in stdout (Python errors often go to stdout)
@@ -322,20 +459,18 @@ def execute_in_dynamic_session(
                 
                 # If there's error content in stderr OR error patterns in stdout, mark as failed
                 if stderr or has_error_in_stdout or status == "Failed" or (return_code and return_code != 0):
-                    active_sessions[session_id]["last_status"] = "Failed"
+                    execution_state["last_status"] = "Failed"
                     # Move error from stdout to stderr if it contains error patterns
                     if has_error_in_stdout and not stderr:
-                        active_sessions[session_id]["last_stderr"] = stdout
-                        active_sessions[session_id]["last_stdout"] = ""
+                        execution_state["last_stderr"] = stdout
+                        execution_state["last_stdout"] = ""
                 else:
-                    active_sessions[session_id]["last_status"] = "Success"
+                    execution_state["last_status"] = "Success"
                 
                 print(f"📊 DEBUG: Raw props.stdout = {repr(stdout)}")
                 print(f"📊 DEBUG: Raw props.stderr = {repr(stderr)}")
                 print(f"📊 DEBUG: Status: '{status}', ReturnCode: {return_code}")
                 print(f"📊 DEBUG: Has error in stdout: {has_error_in_stdout}")
-                print(f"📊 DEBUG: Final active_sessions[{session_id}] = {active_sessions[session_id]}")
-                
                 # Extract the execution result - use stderr if present, otherwise stdout
                 execution_result = stderr if stderr else stdout
             else:
@@ -358,39 +493,36 @@ def execute_in_dynamic_session(
                 if stderr or has_error_in_stdout or not success or return_code != 0:
                     # Move error from stdout to stderr if needed
                     if has_error_in_stdout and not stderr:
-                        active_sessions[session_id]["last_stderr"] = stdout
-                        active_sessions[session_id]["last_stdout"] = ""
+                        execution_state["last_stderr"] = stdout
+                        execution_state["last_stdout"] = ""
                     else:
-                        active_sessions[session_id]["last_stdout"] = stdout
-                        active_sessions[session_id]["last_stderr"] = stderr
-                    active_sessions[session_id]["last_status"] = "Failed"
-                    active_sessions[session_id]["last_returnCode"] = return_code if return_code != 0 else 1
+                        execution_state["last_stdout"] = stdout
+                        execution_state["last_stderr"] = stderr
+                    execution_state["last_status"] = "Failed"
+                    execution_state["last_returnCode"] = return_code if return_code != 0 else 1
                 else:
-                    active_sessions[session_id]["last_stdout"] = stdout
-                    active_sessions[session_id]["last_stderr"] = stderr
-                    active_sessions[session_id]["last_status"] = "Success"
-                    active_sessions[session_id]["last_returnCode"] = return_code
+                    execution_state["last_stdout"] = stdout
+                    execution_state["last_stderr"] = stderr
+                    execution_state["last_status"] = "Success"
+                    execution_state["last_returnCode"] = return_code
                 
                 print(f"📊 DEBUG: Captured stdout: '{stdout}', stderr: '{stderr}'")
                 print(f"📊 DEBUG: Has error in stdout: {has_error_in_stdout}")
-                print(f"📊 DEBUG: Final Status: '{active_sessions[session_id]['last_status']}', ReturnCode: {active_sessions[session_id]['last_returnCode']}")
-                print(f"📊 DEBUG: active_sessions[{session_id}] = {active_sessions[session_id]}")
+                print(f"📊 DEBUG: Final Status: '{execution_state['last_status']}', ReturnCode: {execution_state['last_returnCode']}")
                 
                 # Use stderr if present, otherwise stdout
-                execution_result = active_sessions[session_id]["last_stderr"] if active_sessions[session_id]["last_stderr"] else active_sessions[session_id]["last_stdout"]
+                execution_result = execution_state["last_stderr"] if execution_state["last_stderr"] else execution_state["last_stdout"]
             
-            # Check if execution was successful or failed (use updated values from active_sessions)
-            return_code = active_sessions[session_id].get("last_returnCode", 0)
-            status = active_sessions[session_id].get("last_status", "Success")
-            stderr = active_sessions[session_id].get("last_stderr", "")
-            stdout = active_sessions[session_id].get("last_stdout", "")
+            return_code = execution_state.get("last_returnCode", 0)
+            status = execution_state.get("last_status", "Success")
+            stderr = execution_state.get("last_stderr", "")
+            stdout = execution_state.get("last_stdout", "")
             
             # Format output with clear visual separation
             if status == "Failed" or return_code != 0 or stderr:
                 # Execution failed
                 formatted_output = f"""❌ **Code Execution Failed**
 
-**Session ID:** {session_id[:12]}...
 **Return Code:** {return_code}
 
 **Code Executed:**
@@ -407,8 +539,6 @@ def execute_in_dynamic_session(
             else:
                 # Execution successful
                 formatted_output = f"""✅ **Code Execution Successful**
-
-**Session ID:** {session_id[:12]}...
 
 **Code Executed:**
 ```python
@@ -464,8 +594,8 @@ agent = None
 if AZURE_OPENAI_ENDPOINT:
     try:
         # Create Agent Framework client with managed identity - following official docs pattern
-        chat_client = AzureOpenAIChatClient(
-            deployment_name=AZURE_OPENAI_DEPLOYMENT,
+        chat_client = OpenAIChatClient(
+            model=AZURE_OPENAI_DEPLOYMENT,
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             credential=DefaultAzureCredential()
         )
@@ -485,7 +615,7 @@ Available capabilities:
 For mathematical calculations:
 - CRITICAL: When a user asks for ANY mathematical calculation (addition, subtraction, multiplication, division, etc.), you MUST use execute_in_dynamic_session() to run Python code
 - DO NOT just write out the math in text format - ALWAYS execute it as Python code
-- DO NOT repeat the calculation result in your text response using LaTeX notation like \(5 \times 10\) or mathematical symbols
+- DO NOT repeat the calculation result in your text response using LaTeX notation like \\(5 \\times 10\\) or mathematical symbols
 - After executing the code, the result will be shown automatically in the formatted output - just provide a brief acknowledgment
 - Example: If asked "what's 5 times 10", call execute_in_dynamic_session(code="result = 5 * 10\nprint(result)") and respond with "I've calculated that for you." or "Here's the result:"
 
@@ -507,8 +637,8 @@ Always think step-by-step about which tools will best serve the user's needs."""
                 tools=tools
             )
         else:
-            agent = ChatAgent(
-                chat_client=chat_client,
+            agent = Agent(
+                client=chat_client,
                 instructions=instructions,
                 name="SmartAssistant",
                 tools=tools
@@ -525,12 +655,6 @@ else:
     print("🔧 Set AZURE_OPENAI_ENDPOINT environment variable to use Azure OpenAI")
     print("🔧 Running in demo mode for now")
 
-
-# Global thread storage for conversation continuity
-conversation_threads = {}
-
-# Global tool usage tracking
-current_tools_used = []
 
 @app.route("/", methods=["GET"])
 def index():
@@ -747,6 +871,12 @@ def index():
         .send-button:hover {
             background: #0056b3;
         }
+        .secondary-button {
+            background: #6c757d;
+        }
+        .secondary-button:hover {
+            background: #545b62;
+        }
         .send-button:disabled {
             background: #6c757d;
             cursor: not-allowed;
@@ -826,7 +956,7 @@ def index():
         </div>
         
         <div class="tools-info">
-            <strong>Available Tools:</strong> Tool Discovery 🔧 | Python Execution 📦 | <a href="/docs/" target="_blank" style="color: #007bff;">📖 API Docs</a>
+            <strong>Available Tools:</strong> Tool Discovery 🔧 | Python Execution 📦 | <a href="/docs/" style="color: #007bff;">📖 API Docs</a>
         </div>
         
         <div class="chat-container" id="chatContainer">
@@ -837,14 +967,8 @@ def index():
         
         <div class="input-container">
             <input type="text" id="messageInput" class="input-field" placeholder="Ask me to execute Python code or discover tools..." onkeypress="handleKeyPress(event)">
+            <button id="loginButton" class="send-button secondary-button" onclick="handleLoginClick()" style="display: none;">Sign In</button>
             <button id="sendButton" class="send-button" onclick="sendMessage()">Send</button>
-        </div>
-    </div>
-    
-    <div class="session-panel">
-        <h3>📦 Active Sessions</h3>
-        <div id="sessionList">
-            <div class="no-sessions">No active sessions</div>
         </div>
     </div>
     </div>
@@ -853,6 +977,220 @@ def index():
         const chatContainer = document.getElementById('chatContainer');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
+        const loginButton = document.getElementById('loginButton');
+
+        let authRuntimeConfig = null;
+        const TOKEN_STORAGE_KEY = 'entra_access_token';
+        const TOKEN_EXPIRY_STORAGE_KEY = 'entra_access_token_expiry';
+        const PKCE_VERIFIER_KEY = 'entra_pkce_verifier';
+        const PKCE_STATE_KEY = 'entra_pkce_state';
+
+        async function loadAuthConfig() {
+            try {
+                const response = await fetch('/api/system/auth-config', {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                if (!response.ok) {
+                    return null;
+                }
+                return await response.json();
+            } catch (_error) {
+                return null;
+            }
+        }
+
+        function isBrowserAuthEnabled() {
+            return !!(
+                authRuntimeConfig &&
+                authRuntimeConfig.enabled &&
+                authRuntimeConfig.client_id &&
+                authRuntimeConfig.tenant_id &&
+                authRuntimeConfig.scope
+            );
+        }
+
+        function hasValidAccessToken() {
+            const token = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+            const expiry = Number(sessionStorage.getItem(TOKEN_EXPIRY_STORAGE_KEY) || '0');
+            if (!token || !expiry) {
+                return false;
+            }
+            return Date.now() < expiry;
+        }
+
+        function updateLoginButton() {
+            if (!loginButton) {
+                return;
+            }
+            if (!isBrowserAuthEnabled()) {
+                loginButton.style.display = 'none';
+                return;
+            }
+
+            loginButton.style.display = 'inline-block';
+            loginButton.textContent = hasValidAccessToken() ? 'Sign Out' : 'Sign In';
+        }
+
+        async function toBase64Url(arrayBuffer) {
+            const bytes = new Uint8Array(arrayBuffer);
+            let binary = '';
+            for (let i = 0; i < bytes.length; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        }
+
+        function randomString(length = 64) {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+            const random = new Uint8Array(length);
+            crypto.getRandomValues(random);
+            let out = '';
+            for (let i = 0; i < length; i++) {
+                out += chars[random[i] % chars.length];
+            }
+            return out;
+        }
+
+        async function beginPkceLogin() {
+            const tenant = authRuntimeConfig.tenant_id;
+            const clientId = authRuntimeConfig.client_id;
+            const redirectUri = window.location.origin + '/';
+            const scope = `${authRuntimeConfig.scope} openid profile`;
+
+            const codeVerifier = randomString(96);
+            const state = randomString(40);
+            const challengeBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+            const codeChallenge = await toBase64Url(challengeBuffer);
+
+            sessionStorage.setItem(PKCE_VERIFIER_KEY, codeVerifier);
+            sessionStorage.setItem(PKCE_STATE_KEY, state);
+
+            const authorizeUrl = new URL(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`);
+            authorizeUrl.searchParams.set('client_id', clientId);
+            authorizeUrl.searchParams.set('response_type', 'code');
+            authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+            authorizeUrl.searchParams.set('response_mode', 'query');
+            authorizeUrl.searchParams.set('scope', scope);
+            authorizeUrl.searchParams.set('state', state);
+            authorizeUrl.searchParams.set('code_challenge', codeChallenge);
+            authorizeUrl.searchParams.set('code_challenge_method', 'S256');
+
+            window.location.href = authorizeUrl.toString();
+        }
+
+        async function redeemAuthorizationCode(code, state) {
+            const expectedState = sessionStorage.getItem(PKCE_STATE_KEY);
+            const codeVerifier = sessionStorage.getItem(PKCE_VERIFIER_KEY);
+
+            if (!expectedState || !codeVerifier || state !== expectedState) {
+                throw new Error('Invalid sign-in state');
+            }
+
+            const tenant = authRuntimeConfig.tenant_id;
+            const clientId = authRuntimeConfig.client_id;
+            const redirectUri = window.location.origin + '/';
+
+            const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+            const body = new URLSearchParams();
+            body.set('client_id', clientId);
+            body.set('grant_type', 'authorization_code');
+            body.set('code', code);
+            body.set('redirect_uri', redirectUri);
+            body.set('code_verifier', codeVerifier);
+            body.set('scope', `${authRuntimeConfig.scope} openid profile`);
+
+            const response = await fetch(tokenUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString()
+            });
+
+            if (!response.ok) {
+                let errorMessage = 'Token exchange failed';
+                try {
+                    const errorPayload = await response.json();
+                    errorMessage = errorPayload.error_description || errorPayload.error || errorMessage;
+                } catch (_parseError) {
+                    // Keep the generic message when the identity provider does not return JSON.
+                }
+                throw new Error(errorMessage);
+            }
+
+            const payload = await response.json();
+            const expiresIn = Number(payload.expires_in || 3600);
+            const expiryMs = Date.now() + (expiresIn - 60) * 1000;
+
+            sessionStorage.setItem(TOKEN_STORAGE_KEY, payload.access_token);
+            sessionStorage.setItem(TOKEN_EXPIRY_STORAGE_KEY, String(expiryMs));
+
+            sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+            sessionStorage.removeItem(PKCE_STATE_KEY);
+        }
+
+        function clearTokenState() {
+            sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+            sessionStorage.removeItem(TOKEN_EXPIRY_STORAGE_KEY);
+            sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+            sessionStorage.removeItem(PKCE_STATE_KEY);
+        }
+
+        async function initBrowserAuth() {
+            authRuntimeConfig = await loadAuthConfig();
+            if (!authRuntimeConfig || !authRuntimeConfig.enabled || !authRuntimeConfig.client_id || !authRuntimeConfig.tenant_id || !authRuntimeConfig.scope) {
+                updateLoginButton();
+                return;
+            }
+
+            try {
+                const params = new URLSearchParams(window.location.search);
+                const code = params.get('code');
+                const state = params.get('state');
+                if (code && state) {
+                    await redeemAuthorizationCode(code, state);
+
+                    const cleanUrl = new URL(window.location.href);
+                    cleanUrl.searchParams.delete('code');
+                    cleanUrl.searchParams.delete('state');
+                    cleanUrl.searchParams.delete('session_state');
+                    cleanUrl.searchParams.delete('error');
+                    cleanUrl.searchParams.delete('error_description');
+                    window.history.replaceState({}, document.title, cleanUrl.toString());
+                }
+            } catch (error) {
+                clearTokenState();
+                addMessage(`❌ Sign-in failed: ${error.message}`);
+            }
+
+            updateLoginButton();
+        }
+
+        async function handleLoginClick() {
+            if (!isBrowserAuthEnabled()) {
+                addMessage('🔒 Browser sign-in is not configured yet.');
+                return;
+            }
+
+            if (hasValidAccessToken()) {
+                clearTokenState();
+                updateLoginButton();
+                return;
+            }
+
+            await beginPkceLogin();
+        }
+
+        async function getAccessTokenForChat() {
+            if (!isBrowserAuthEnabled()) {
+                return null;
+            }
+
+            if (!hasValidAccessToken()) {
+                return null;
+            }
+
+            return sessionStorage.getItem(TOKEN_STORAGE_KEY);
+        }
 
         function addMessage(text, isUser = false, toolsUsed = null) {
             const messageDiv = document.createElement('div');
@@ -924,16 +1262,35 @@ def index():
             chatContainer.classList.add('loading');
 
             try {
+                let authorizationHeader = null;
+                if (authRuntimeConfig && authRuntimeConfig.enabled) {
+                    const accessToken = await getAccessTokenForChat();
+                    if (!accessToken) {
+                        addMessage('🔒 Sign-in required. Click Sign In, then try again.');
+                        return;
+                    }
+                    authorizationHeader = `Bearer ${accessToken}`;
+                }
+
                 const response = await fetch('/api/chat/', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        ...(authorizationHeader ? { 'Authorization': authorizationHeader } : {}),
                     },
                     body: JSON.stringify({
-                        prompt: message,
-                        session_id: 'web_chat'
+                        prompt: message
                     })
                 });
+
+                if (response.status === 401) {
+                    if (authRuntimeConfig && authRuntimeConfig.enabled) {
+                        addMessage('🔒 Your sign-in token was rejected. Please Sign Out and Sign In again.');
+                    } else {
+                        addMessage('🔒 Authentication required for chat endpoints. Configure browser Entra auth or platform auth.');
+                    }
+                    return;
+                }
 
                 const data = await response.json();
                 console.log('📥 Received response:', data);
@@ -946,8 +1303,6 @@ def index():
                         false,
                         data.tools_used || null
                     );
-                    console.log('🔄 Calling updateSessionPanel with:', data.active_sessions);
-                    updateSessionPanel(data.active_sessions || {});
                 }
             } catch (error) {
                 addMessage(`❌ Connection error: ${error.message}`);
@@ -1010,6 +1365,8 @@ def index():
         }
         
 
+        initBrowserAuth();
+
         // Focus input on load
         messageInput.focus();
     </script>
@@ -1022,15 +1379,16 @@ class Chat(Resource):
     @api.doc('chat_with_agent')
     @api.expect(chat_request_model)
     @api.marshal_with(chat_response_model, code=200)
+    @api.response(401, 'Unauthorized', error_response_model)
     @api.response(400, 'Bad Request', error_response_model)
     @api.response(500, 'Internal Server Error', error_response_model)
     def post(self):
         """Send a message to the AI agent and get a response with automatic tool selection"""
-        data = request.json
+        data = request.get_json(silent=True) or {}
         prompt = data.get("prompt", "")
         session_id = data.get("session_id", "default")
         
-        if not prompt:
+        if not isinstance(prompt, str) or not prompt.strip():
             return {"error": "No prompt provided"}, 400
         
         try:
@@ -1039,32 +1397,28 @@ class Chat(Resource):
                     "error": "Azure OpenAI configuration required. Please set AZURE_OPENAI_ENDPOINT environment variable and ensure proper authentication."
                 }, 500
             
-            print(f"\n🚀 NEW REQUEST (Session: {session_id})")
+            print("\n🚀 NEW REQUEST")
             print(f"📝 User Input: {prompt}")
             print("🤖 Agent analyzing request and selecting appropriate tools...")
             
             # Get or create conversation thread for session continuity
             if session_id not in conversation_threads:
-                conversation_threads[session_id] = agent.get_new_thread()
+                conversation_threads[session_id] = agent.create_session(session_id=session_id)
             
             thread = conversation_threads[session_id]
             
-            # Reset tool usage tracking for this request
-            global current_tools_used, current_request_sessions
-            current_tools_used = []
-            current_request_sessions = set()
-            print(f"🔧 DEBUG: Reset current_tools_used and session tracking, starting fresh for this request")
+            tools_used = []
+            session_token = current_session_id.set(session_id)
+            tools_token = request_tools_used.set(tools_used)
             
             # Run the agent asynchronously with conversation thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             print(f"🤖 DEBUG: About to call agent.run() with prompt: {prompt[:50]}...")
-            result = loop.run_until_complete(agent.run(prompt, thread=thread))
+            result = loop.run_until_complete(agent.run(prompt, session=thread))
             loop.close()
             print(f"🤖 DEBUG: agent.run() completed")
             
-            # Get the tools that were used during this request
-            tools_used = current_tools_used.copy()
             print(f"🔧 DEBUG: Tools used during this request: {tools_used}")
             
             print(f"✅ Agent Response Generated")
@@ -1074,13 +1428,6 @@ class Chat(Resource):
             else:
                 print(f"⚠️ WARNING: No tools were used for this request!")
             
-            import copy
-            sessions_copy = copy.deepcopy(active_sessions)
-            print(f"📊 Active Sessions Count: {len(sessions_copy)}")
-            print(f"📊 DEBUG: sessions_copy = {sessions_copy}")
-            if sessions_copy:
-                print(f"📊 Session IDs: {list(sessions_copy.keys())}")
-            
             # Build tools_available list based on what's actually registered
             tools_available = ["search_tools_available"]
             if SESSION_POOL_ENDPOINT:
@@ -1088,15 +1435,12 @@ class Chat(Resource):
             
             response_data = {
                 "response": result.text,
-                "session_id": session_id,
                 "agent": "Microsoft Agent Framework SmartAssistant",
                 "model": AZURE_OPENAI_DEPLOYMENT,
                 "tools_used": tools_used,
                 "tools_available": tools_available,
-                "conversation_length": len(thread.messages) if hasattr(thread, 'messages') else 0,
-                "active_sessions": sessions_copy if sessions_copy else None
+                "conversation_length": len(thread.messages) if hasattr(thread, 'messages') else 0
             }
-            print(f"📊 DEBUG: Returning response with active_sessions = {response_data.get('active_sessions')}")
             return response_data
         except Exception as e:
             print(f"❌ Error: {str(e)}")
@@ -1107,24 +1451,25 @@ class ChatStream(Resource):
     @api.doc('chat_stream')
     @api.expect(chat_request_model)
     @api.response(200, 'Success')
+    @api.response(401, 'Unauthorized', error_response_model)
     @api.response(400, 'Bad Request', error_response_model)
     @api.response(500, 'Internal Server Error', error_response_model)
     def post(self):
         """Stream responses from the AI agent in real-time (experimental)"""
-        data = request.json
+        data = request.get_json(silent=True) or {}
         prompt = data.get("prompt", "")
         session_id = data.get("session_id", "default")
         
-        if not prompt:
+        if not isinstance(prompt, str) or not prompt.strip():
             return {"error": "No prompt provided"}, 400
         
         try:
-            print(f"\n🚀 STREAMING REQUEST (Session: {session_id})")
+            print("\n🚀 STREAMING REQUEST")
             print(f"📝 User Input: {prompt}")
             
             # Get or create conversation thread
             if session_id not in conversation_threads:
-                conversation_threads[session_id] = agent.get_new_thread()
+                conversation_threads[session_id] = agent.create_session(session_id=session_id)
             
             thread = conversation_threads[session_id]
             
@@ -1132,12 +1477,14 @@ class ChatStream(Resource):
                 q = queue.Queue()
                 
                 def run_async_stream():
+                    session_token = current_session_id.set(session_id)
+                    tools_token = request_tools_used.set([])
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
 
                     async def collect_stream():
                         try:
-                            async for chunk in agent.run_stream(prompt, thread=thread):
+                            async for chunk in agent.run(prompt, session=thread, stream=True):
                                 if chunk.text:
                                     q.put(("data", chunk.text))
                                     print(f"📡 Streaming: {chunk.text}", end="", flush=True)
@@ -1145,8 +1492,12 @@ class ChatStream(Resource):
                         except Exception as stream_error:
                             q.put(("error", str(stream_error)))
 
-                    loop.run_until_complete(collect_stream())
-                    loop.close()
+                    try:
+                        loop.run_until_complete(collect_stream())
+                    finally:
+                        loop.close()
+                        current_session_id.reset(session_token)
+                        request_tools_used.reset(tools_token)
 
                 threading.Thread(target=run_async_stream, daemon=True).start()
 
@@ -1162,12 +1513,12 @@ class ChatStream(Resource):
                         continue
 
                     if kind == "data" and payload is not None:
-                        yield f"data: {json.dumps({'text': payload, 'session_id': session_id})}\n\n"
+                        yield f"data: {json.dumps({'text': payload})}\n\n"
                     elif kind == "error" and payload is not None:
-                        yield f"event: error\ndata: {json.dumps({'error': payload, 'session_id': session_id})}\n\n"
+                        yield f"event: error\ndata: {json.dumps({'error': payload})}\n\n"
                         break
                     elif kind == "done":
-                        yield f"event: done\ndata: {json.dumps({'session_id': session_id})}\n\n"
+                        yield "event: done\ndata: {}\n\n"
                         break
 
                 print(f"\n✅ Streaming Complete")
@@ -1213,6 +1564,19 @@ class TestSessionPayload(Resource):
             print(f"🔍 TEST DEBUG - Exception: {e}", flush=True)
             return {"error": str(e)}, 500
 
+@system_ns.route('/auth-config')
+class AuthConfig(Resource):
+    @api.doc('auth_config')
+    def get(self):
+        return {
+            "enabled": bool(CHAT_AUTH_CLIENT_ID and CHAT_AUTH_TENANT_ID and CHAT_AUTH_SCOPE),
+            "tenant_id": CHAT_AUTH_TENANT_ID,
+            "client_id": CHAT_AUTH_CLIENT_ID,
+            "audience": CHAT_AUTH_AUDIENCE,
+            "scope": CHAT_AUTH_SCOPE,
+            "platform_auth_enabled": TRUST_EASYAUTH_HEADERS
+        }
+
 @system_ns.route('/health')
 class Health(Resource):
     @api.doc('health_check')
@@ -1236,8 +1600,6 @@ class Health(Resource):
             "endpoint": AZURE_OPENAI_ENDPOINT,
             "model": AZURE_OPENAI_DEPLOYMENT,
             "tools_count": 3,
-            "active_sessions": len(conversation_threads),
-            "dynamic_sessions": len(active_sessions),
             "session_pool_configured": bool(SESSION_POOL_ENDPOINT),
             "azure_configured": True
         }
@@ -1267,10 +1629,11 @@ class Tools(Resource):
             "framework": "Microsoft Agent Framework"
         }
 
-@chat_ns.route('/sessions/<string:session_id>')
+@chat_ns.route('/session')
 class SessionManager(Resource):
     @api.doc('clear_session')
     @api.response(200, 'Session cleared successfully')
+    @api.response(401, 'Unauthorized', error_response_model)
     @api.response(404, 'Session not found')
     def delete(self, session_id):
         """Clear conversation history for a specific session"""
@@ -1287,13 +1650,12 @@ if __name__ == "__main__":
     print("🔧 Available Tools:")
     print("   🔧 search_tools_available - Tool discovery")
     print("   📦 execute_in_dynamic_session - Secure code execution")
-    print(f"📊 Dynamic Sessions: {len(active_sessions)} active")
     print(f"🔗 Python Pool: {'Configured' if SESSION_POOL_ENDPOINT else 'Not configured'}")
     print("\n📋 Endpoints:")
     print("   POST /chat - Main chat interface")
     print("   POST /chat/stream - Streaming responses")
     print("   GET /tools - List available tools")
     print("   GET /health - Health check")
-    print("   DELETE /sessions/<id> - Clear session")
+    print("   DELETE /api/chat/session - Clear the current client session")
     print("\n🎯 The agent will automatically select appropriate tools based on your requests!")
     app.run(host="0.0.0.0", port=8080)
