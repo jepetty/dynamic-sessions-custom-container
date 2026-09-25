@@ -11,30 +11,16 @@ import queue
 from contextvars import ContextVar
 from flask import Flask, request, jsonify, send_file, Response, stream_with_context, g
 from flask_restx import Api, Resource, fields, Namespace
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from agent_framework import ChatAgent, AgentThread
-try:
-    from agent_framework import ai_function
-except ImportError:
-    try:
-        from agent_framework.tools import ai_function
-    except ImportError:
-        try:
-            from agent_framework.decorators import ai_function
-        except ImportError:
-            try:
-                from agent_framework import tool as ai_function
-            except ImportError:
-                def ai_function(func=None, **_kwargs):
-                    def decorator(f):
-                        return f
-                    return decorator(func) if func else decorator
-from agent_framework.azure import AzureOpenAIChatClient
+from agent_framework import Agent, AgentSession
+from agent_framework import tool as ai_function
+from agent_framework.openai import OpenAIChatClient
 from azure.identity import DefaultAzureCredential
 from typing import Annotated, List, Dict, Any, Optional
 from pydantic import Field
 import requests
 import aiohttp
+import jwt
+from jwt import InvalidTokenError
 
 app = Flask(__name__)
 
@@ -123,11 +109,18 @@ SESSION_COOKIE_MAX_AGE_SECONDS = int(os.getenv("SESSION_COOKIE_MAX_AGE_SECONDS",
 MAX_CONVERSATION_THREADS = int(os.getenv("MAX_CONVERSATION_THREADS", "100"))
 SESSION_SIGNING_KEY = os.getenv("SESSION_SIGNING_KEY") or secrets.token_hex(32)
 
-current_session_id: ContextVar[Optional[str]] = ContextVar("current_session_id", default=None)
-request_tools_used: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar("request_tools_used", default=None)
-session_serializer = URLSafeTimedSerializer(SESSION_SIGNING_KEY, salt="aca-sample-session")
-conversation_threads: Dict[str, Dict[str, Any]] = {}
-conversation_threads_lock = threading.Lock()
+# Chat endpoint authentication settings
+ALLOW_UNAUTHENTICATED_CHAT = os.getenv("ALLOW_UNAUTHENTICATED_CHAT", "false").lower() in ("1", "true", "yes")
+TRUST_EASYAUTH_HEADERS = os.getenv("TRUST_EASYAUTH_HEADERS", "false").lower() in ("1", "true", "yes")
+CHAT_AUTH_TENANT_ID = os.getenv("CHAT_AUTH_TENANT_ID") or os.getenv("AZURE_TENANT_ID", "")
+CHAT_AUTH_AUDIENCE = os.getenv("CHAT_AUTH_AUDIENCE", "")
+CHAT_AUTH_CLIENT_ID = os.getenv("CHAT_AUTH_CLIENT_ID", "")
+CHAT_AUTH_SCOPE = os.getenv("CHAT_AUTH_SCOPE", f"{CHAT_AUTH_AUDIENCE}/access_as_user" if CHAT_AUTH_AUDIENCE else "")
+
+_entra_jwks_clients: Dict[str, Any] = {}
+
+# Session management storage
+active_sessions: Dict[str, Dict[str, Any]] = {}
 
 
 def _get_request_tools() -> List[Dict[str, Any]]:
@@ -214,6 +207,90 @@ def persist_client_session(response):
             path="/",
         )
     return response
+
+
+def _extract_bearer_token(auth_header: str) -> str:
+    if not auth_header:
+        return ""
+    parts = auth_header.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return ""
+    return parts[1].strip()
+
+
+def _get_entra_jwks_client(tenant_id: str) -> Any:
+    if tenant_id not in _entra_jwks_clients:
+        jwks_url = f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys"
+        _entra_jwks_clients[tenant_id] = jwt.PyJWKClient(jwks_url)
+    return _entra_jwks_clients[tenant_id]
+
+
+def _has_valid_entra_bearer_token() -> bool:
+    if not CHAT_AUTH_TENANT_ID or not CHAT_AUTH_AUDIENCE:
+        return False
+
+    presented_token = _extract_bearer_token(request.headers.get("Authorization", ""))
+    if not presented_token:
+        return False
+
+    try:
+        jwks_client = _get_entra_jwks_client(CHAT_AUTH_TENANT_ID)
+        signing_key = jwks_client.get_signing_key_from_jwt(presented_token).key
+        expected_audiences = [CHAT_AUTH_AUDIENCE]
+        if CHAT_AUTH_CLIENT_ID and CHAT_AUTH_CLIENT_ID not in expected_audiences:
+            expected_audiences.append(CHAT_AUTH_CLIENT_ID)
+
+        claims = jwt.decode(
+            presented_token,
+            signing_key,
+            algorithms=["RS256"],
+            audience=expected_audiences,
+            options={"require": ["iss", "aud", "exp"]}
+        )
+
+        valid_issuers = {
+            f"https://login.microsoftonline.com/{CHAT_AUTH_TENANT_ID}/v2.0",
+            f"https://sts.windows.net/{CHAT_AUTH_TENANT_ID}/"
+        }
+        if claims.get("iss") not in valid_issuers:
+            return False
+
+        # Require a caller identity claim so only authenticated principals are accepted.
+        return bool(claims.get("oid") or claims.get("sub"))
+    except InvalidTokenError as token_error:
+        print(f"❌ Chat auth token validation failed: {token_error}")
+        return False
+    except Exception as auth_error:
+        print(f"❌ Chat auth processing error: {auth_error}")
+        return False
+
+
+def _has_trusted_easyauth_identity() -> bool:
+    if not TRUST_EASYAUTH_HEADERS:
+        return False
+
+    principal_id = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID", "")
+    principal_provider = request.headers.get("X-MS-CLIENT-PRINCIPAL-IDP", "")
+    return bool(principal_id) and principal_provider.lower() in ("aad", "entra")
+
+
+def _is_authenticated_chat_request() -> bool:
+    if ALLOW_UNAUTHENTICATED_CHAT:
+        return True
+    if _has_valid_entra_bearer_token():
+        return True
+    if _has_trusted_easyauth_identity():
+        return True
+    return False
+
+
+@app.before_request
+def require_auth_for_chat_endpoints():
+    if request.path.startswith("/api/chat") and not _is_authenticated_chat_request():
+        return jsonify({
+            "error": "Authentication required for chat endpoints",
+            "details": "Provide a valid Microsoft Entra Bearer token for CHAT_AUTH_AUDIENCE, or configure trusted platform authentication."
+        }), 401
 
 # Enhanced AI functions (tools) for the agent
 @ai_function
@@ -335,12 +412,11 @@ def execute_in_dynamic_session(
         print("📦 Executing Python code in the current client session...")
         print(f"📋 Payload: {execution_payload}")
         try:
-            print("🚀 Making request to the configured session pool")
+            print(f"🚀 Making authenticated request to: {session_url}")
             print(f"📦 Payload: {execution_payload}")
             
             response = requests.post(session_url, json=execution_payload, headers=headers, timeout=60)
             print(f"📊 Response Status: {response.status_code}")
-            print(f"📝 Response Headers: {dict(response.headers)}")
             print(f"📝 Response Body: {response.text}")
         except requests.exceptions.RequestException as req_error:
             print(f"❌ Request failed: {req_error}")
@@ -518,8 +594,8 @@ agent = None
 if AZURE_OPENAI_ENDPOINT:
     try:
         # Create Agent Framework client with managed identity - following official docs pattern
-        chat_client = AzureOpenAIChatClient(
-            deployment_name=AZURE_OPENAI_DEPLOYMENT,
+        chat_client = OpenAIChatClient(
+            model=AZURE_OPENAI_DEPLOYMENT,
             azure_endpoint=AZURE_OPENAI_ENDPOINT,
             credential=DefaultAzureCredential()
         )
@@ -561,8 +637,8 @@ Always think step-by-step about which tools will best serve the user's needs."""
                 tools=tools
             )
         else:
-            agent = ChatAgent(
-                chat_client=chat_client,
+            agent = Agent(
+                client=chat_client,
                 instructions=instructions,
                 name="SmartAssistant",
                 tools=tools
@@ -795,6 +871,12 @@ def index():
         .send-button:hover {
             background: #0056b3;
         }
+        .secondary-button {
+            background: #6c757d;
+        }
+        .secondary-button:hover {
+            background: #545b62;
+        }
         .send-button:disabled {
             background: #6c757d;
             cursor: not-allowed;
@@ -874,7 +956,7 @@ def index():
         </div>
         
         <div class="tools-info">
-            <strong>Available Tools:</strong> Tool Discovery 🔧 | Python Execution 📦 | <a href="/docs/" target="_blank" style="color: #007bff;">📖 API Docs</a>
+            <strong>Available Tools:</strong> Tool Discovery 🔧 | Python Execution 📦 | <a href="/docs/" style="color: #007bff;">📖 API Docs</a>
         </div>
         
         <div class="chat-container" id="chatContainer">
@@ -885,6 +967,7 @@ def index():
         
         <div class="input-container">
             <input type="text" id="messageInput" class="input-field" placeholder="Ask me to execute Python code or discover tools..." onkeypress="handleKeyPress(event)">
+            <button id="loginButton" class="send-button secondary-button" onclick="handleLoginClick()" style="display: none;">Sign In</button>
             <button id="sendButton" class="send-button" onclick="sendMessage()">Send</button>
         </div>
     </div>
@@ -894,6 +977,220 @@ def index():
         const chatContainer = document.getElementById('chatContainer');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
+        const loginButton = document.getElementById('loginButton');
+
+        let authRuntimeConfig = null;
+        const TOKEN_STORAGE_KEY = 'entra_access_token';
+        const TOKEN_EXPIRY_STORAGE_KEY = 'entra_access_token_expiry';
+        const PKCE_VERIFIER_KEY = 'entra_pkce_verifier';
+        const PKCE_STATE_KEY = 'entra_pkce_state';
+
+        async function loadAuthConfig() {
+            try {
+                const response = await fetch('/api/system/auth-config', {
+                    method: 'GET',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                if (!response.ok) {
+                    return null;
+                }
+                return await response.json();
+            } catch (_error) {
+                return null;
+            }
+        }
+
+        function isBrowserAuthEnabled() {
+            return !!(
+                authRuntimeConfig &&
+                authRuntimeConfig.enabled &&
+                authRuntimeConfig.client_id &&
+                authRuntimeConfig.tenant_id &&
+                authRuntimeConfig.scope
+            );
+        }
+
+        function hasValidAccessToken() {
+            const token = sessionStorage.getItem(TOKEN_STORAGE_KEY);
+            const expiry = Number(sessionStorage.getItem(TOKEN_EXPIRY_STORAGE_KEY) || '0');
+            if (!token || !expiry) {
+                return false;
+            }
+            return Date.now() < expiry;
+        }
+
+        function updateLoginButton() {
+            if (!loginButton) {
+                return;
+            }
+            if (!isBrowserAuthEnabled()) {
+                loginButton.style.display = 'none';
+                return;
+            }
+
+            loginButton.style.display = 'inline-block';
+            loginButton.textContent = hasValidAccessToken() ? 'Sign Out' : 'Sign In';
+        }
+
+        async function toBase64Url(arrayBuffer) {
+            const bytes = new Uint8Array(arrayBuffer);
+            let binary = '';
+            for (let i = 0; i < bytes.length; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+        }
+
+        function randomString(length = 64) {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+            const random = new Uint8Array(length);
+            crypto.getRandomValues(random);
+            let out = '';
+            for (let i = 0; i < length; i++) {
+                out += chars[random[i] % chars.length];
+            }
+            return out;
+        }
+
+        async function beginPkceLogin() {
+            const tenant = authRuntimeConfig.tenant_id;
+            const clientId = authRuntimeConfig.client_id;
+            const redirectUri = window.location.origin + '/';
+            const scope = `${authRuntimeConfig.scope} openid profile`;
+
+            const codeVerifier = randomString(96);
+            const state = randomString(40);
+            const challengeBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(codeVerifier));
+            const codeChallenge = await toBase64Url(challengeBuffer);
+
+            sessionStorage.setItem(PKCE_VERIFIER_KEY, codeVerifier);
+            sessionStorage.setItem(PKCE_STATE_KEY, state);
+
+            const authorizeUrl = new URL(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`);
+            authorizeUrl.searchParams.set('client_id', clientId);
+            authorizeUrl.searchParams.set('response_type', 'code');
+            authorizeUrl.searchParams.set('redirect_uri', redirectUri);
+            authorizeUrl.searchParams.set('response_mode', 'query');
+            authorizeUrl.searchParams.set('scope', scope);
+            authorizeUrl.searchParams.set('state', state);
+            authorizeUrl.searchParams.set('code_challenge', codeChallenge);
+            authorizeUrl.searchParams.set('code_challenge_method', 'S256');
+
+            window.location.href = authorizeUrl.toString();
+        }
+
+        async function redeemAuthorizationCode(code, state) {
+            const expectedState = sessionStorage.getItem(PKCE_STATE_KEY);
+            const codeVerifier = sessionStorage.getItem(PKCE_VERIFIER_KEY);
+
+            if (!expectedState || !codeVerifier || state !== expectedState) {
+                throw new Error('Invalid sign-in state');
+            }
+
+            const tenant = authRuntimeConfig.tenant_id;
+            const clientId = authRuntimeConfig.client_id;
+            const redirectUri = window.location.origin + '/';
+
+            const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+            const body = new URLSearchParams();
+            body.set('client_id', clientId);
+            body.set('grant_type', 'authorization_code');
+            body.set('code', code);
+            body.set('redirect_uri', redirectUri);
+            body.set('code_verifier', codeVerifier);
+            body.set('scope', `${authRuntimeConfig.scope} openid profile`);
+
+            const response = await fetch(tokenUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString()
+            });
+
+            if (!response.ok) {
+                let errorMessage = 'Token exchange failed';
+                try {
+                    const errorPayload = await response.json();
+                    errorMessage = errorPayload.error_description || errorPayload.error || errorMessage;
+                } catch (_parseError) {
+                    // Keep the generic message when the identity provider does not return JSON.
+                }
+                throw new Error(errorMessage);
+            }
+
+            const payload = await response.json();
+            const expiresIn = Number(payload.expires_in || 3600);
+            const expiryMs = Date.now() + (expiresIn - 60) * 1000;
+
+            sessionStorage.setItem(TOKEN_STORAGE_KEY, payload.access_token);
+            sessionStorage.setItem(TOKEN_EXPIRY_STORAGE_KEY, String(expiryMs));
+
+            sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+            sessionStorage.removeItem(PKCE_STATE_KEY);
+        }
+
+        function clearTokenState() {
+            sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+            sessionStorage.removeItem(TOKEN_EXPIRY_STORAGE_KEY);
+            sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+            sessionStorage.removeItem(PKCE_STATE_KEY);
+        }
+
+        async function initBrowserAuth() {
+            authRuntimeConfig = await loadAuthConfig();
+            if (!authRuntimeConfig || !authRuntimeConfig.enabled || !authRuntimeConfig.client_id || !authRuntimeConfig.tenant_id || !authRuntimeConfig.scope) {
+                updateLoginButton();
+                return;
+            }
+
+            try {
+                const params = new URLSearchParams(window.location.search);
+                const code = params.get('code');
+                const state = params.get('state');
+                if (code && state) {
+                    await redeemAuthorizationCode(code, state);
+
+                    const cleanUrl = new URL(window.location.href);
+                    cleanUrl.searchParams.delete('code');
+                    cleanUrl.searchParams.delete('state');
+                    cleanUrl.searchParams.delete('session_state');
+                    cleanUrl.searchParams.delete('error');
+                    cleanUrl.searchParams.delete('error_description');
+                    window.history.replaceState({}, document.title, cleanUrl.toString());
+                }
+            } catch (error) {
+                clearTokenState();
+                addMessage(`❌ Sign-in failed: ${error.message}`);
+            }
+
+            updateLoginButton();
+        }
+
+        async function handleLoginClick() {
+            if (!isBrowserAuthEnabled()) {
+                addMessage('🔒 Browser sign-in is not configured yet.');
+                return;
+            }
+
+            if (hasValidAccessToken()) {
+                clearTokenState();
+                updateLoginButton();
+                return;
+            }
+
+            await beginPkceLogin();
+        }
+
+        async function getAccessTokenForChat() {
+            if (!isBrowserAuthEnabled()) {
+                return null;
+            }
+
+            if (!hasValidAccessToken()) {
+                return null;
+            }
+
+            return sessionStorage.getItem(TOKEN_STORAGE_KEY);
+        }
 
         function addMessage(text, isUser = false, toolsUsed = null) {
             const messageDiv = document.createElement('div');
@@ -964,15 +1261,35 @@ def index():
             chatContainer.classList.add('loading');
 
             try {
+                let authorizationHeader = null;
+                if (authRuntimeConfig && authRuntimeConfig.enabled) {
+                    const accessToken = await getAccessTokenForChat();
+                    if (!accessToken) {
+                        addMessage('🔒 Sign-in required. Click Sign In, then try again.');
+                        return;
+                    }
+                    authorizationHeader = `Bearer ${accessToken}`;
+                }
+
                 const response = await fetch('/api/chat/', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        ...(authorizationHeader ? { 'Authorization': authorizationHeader } : {}),
                     },
                     body: JSON.stringify({
                         prompt: message
                     })
                 });
+
+                if (response.status === 401) {
+                    if (authRuntimeConfig && authRuntimeConfig.enabled) {
+                        addMessage('🔒 Your sign-in token was rejected. Please Sign Out and Sign In again.');
+                    } else {
+                        addMessage('🔒 Authentication required for chat endpoints. Configure browser Entra auth or platform auth.');
+                    }
+                    return;
+                }
 
                 const data = await response.json();
                 console.log('📥 Received response:', data);
@@ -997,6 +1314,49 @@ def index():
             }
         }
 
+        function updateSessionPanel(sessions) {
+            const sessionList = document.getElementById('sessionList');
+            console.log('📊 Updating session panel:', sessions);
+            
+            if (!sessions || Object.keys(sessions).length === 0) {
+                console.log('⚠️ No sessions to display');
+                sessionList.innerHTML = '<div class="no-sessions">No active sessions</div>';
+                return;
+            }
+            
+            console.log('✅ Found', Object.keys(sessions).length, 'sessions');
+            let html = '';
+            for (const [sessionId, sessionData] of Object.entries(sessions)) {
+                const shortId = sessionId.substring(0, 16);
+                console.log('  📝 Session:', shortId, sessionData);
+                const jsonData = JSON.stringify(sessionData, null, 2);
+                
+                // Format session data with better readability
+                html += `
+                    <div class="session-item">
+                        <div class="session-header">🔹 Session ID: ${shortId}...</div>
+                        <div class="session-details">
+                            <div><strong>Executions:</strong> ${sessionData.execution_count || 0}</div>
+                            <div><strong>Created:</strong> ${new Date(sessionData.created_at).toLocaleTimeString()}</div>
+                            ${sessionData.last_used ? `<div><strong>Last Used:</strong> ${new Date(sessionData.last_used).toLocaleTimeString()}</div>` : ''}
+                            ${sessionData.last_status ? `<div><strong>Status:</strong> ${sessionData.last_status}</div>` : ''}
+                            ${sessionData.last_returnCode !== undefined ? `<div><strong>Return Code:</strong> ${sessionData.last_returnCode}</div>` : ''}
+                            ${sessionData.last_stdout ? `<div class="output-section"><strong>stdout:</strong><pre>${sessionData.last_stdout}</pre></div>` : ''}
+                            ${sessionData.last_stderr ? `<div class="error-section"><strong>stderr:</strong><pre>${sessionData.last_stderr}</pre></div>` : ''}
+                        </div>
+                        <details class="session-json-toggle">
+                            <summary>View Raw JSON</summary>
+                            <pre class="session-json">${jsonData}</pre>
+                        </details>
+                    </div>
+                `;
+            }
+            sessionList.innerHTML = html;
+        }
+        
+
+        initBrowserAuth();
+
         // Focus input on load
         messageInput.focus();
     </script>
@@ -1009,15 +1369,14 @@ class Chat(Resource):
     @api.doc('chat_with_agent')
     @api.expect(chat_request_model)
     @api.marshal_with(chat_response_model, code=200)
+    @api.response(401, 'Unauthorized', error_response_model)
     @api.response(400, 'Bad Request', error_response_model)
     @api.response(500, 'Internal Server Error', error_response_model)
     def post(self):
         """Send a message to the AI agent and get a response with automatic tool selection"""
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            return {"error": "A JSON object is required"}, 400
-        prompt = data.get("prompt")
-        session_id = g.client_session_id
+        data = request.get_json(silent=True) or {}
+        prompt = data.get("prompt", "")
+        session_id = data.get("session_id", "default")
         
         if not isinstance(prompt, str) or not prompt.strip():
             return {"error": "No prompt provided"}, 400
@@ -1032,24 +1391,22 @@ class Chat(Resource):
             print(f"📝 User Input: {prompt}")
             print("🤖 Agent analyzing request and selecting appropriate tools...")
             
-            thread = _get_conversation_thread(session_id)
+            # Get or create conversation thread for session continuity
+            if session_id not in conversation_threads:
+                conversation_threads[session_id] = agent.create_session(session_id=session_id)
+            
+            thread = conversation_threads[session_id]
             
             tools_used = []
             session_token = current_session_id.set(session_id)
             tools_token = request_tools_used.set(tools_used)
             
             # Run the agent asynchronously with conversation thread
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                print(f"🤖 DEBUG: About to call agent.run() with prompt: {prompt[:50]}...")
-                try:
-                    result = loop.run_until_complete(agent.run(prompt, thread=thread))
-                finally:
-                    loop.close()
-            finally:
-                current_session_id.reset(session_token)
-                request_tools_used.reset(tools_token)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            print(f"🤖 DEBUG: About to call agent.run() with prompt: {prompt[:50]}...")
+            result = loop.run_until_complete(agent.run(prompt, session=thread))
+            loop.close()
             print(f"🤖 DEBUG: agent.run() completed")
             
             print(f"🔧 DEBUG: Tools used during this request: {tools_used}")
@@ -1084,15 +1441,14 @@ class ChatStream(Resource):
     @api.doc('chat_stream')
     @api.expect(chat_request_model)
     @api.response(200, 'Success')
+    @api.response(401, 'Unauthorized', error_response_model)
     @api.response(400, 'Bad Request', error_response_model)
     @api.response(500, 'Internal Server Error', error_response_model)
     def post(self):
         """Stream responses from the AI agent in real-time (experimental)"""
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict):
-            return {"error": "A JSON object is required"}, 400
-        prompt = data.get("prompt")
-        session_id = g.client_session_id
+        data = request.get_json(silent=True) or {}
+        prompt = data.get("prompt", "")
+        session_id = data.get("session_id", "default")
         
         if not isinstance(prompt, str) or not prompt.strip():
             return {"error": "No prompt provided"}, 400
@@ -1101,7 +1457,11 @@ class ChatStream(Resource):
             print("\n🚀 STREAMING REQUEST")
             print(f"📝 User Input: {prompt}")
             
-            thread = _get_conversation_thread(session_id)
+            # Get or create conversation thread
+            if session_id not in conversation_threads:
+                conversation_threads[session_id] = agent.create_session(session_id=session_id)
+            
+            thread = conversation_threads[session_id]
             
             def stream_generator():
                 q = queue.Queue()
@@ -1114,7 +1474,7 @@ class ChatStream(Resource):
 
                     async def collect_stream():
                         try:
-                            async for chunk in agent.run_stream(prompt, thread=thread):
+                            async for chunk in agent.run(prompt, session=thread, stream=True):
                                 if chunk.text:
                                     q.put(("data", chunk.text))
                                     print(f"📡 Streaming: {chunk.text}", end="", flush=True)
@@ -1164,6 +1524,48 @@ class ChatStream(Resource):
         except Exception as e:
             print(f"❌ Streaming Error: {str(e)}")
             return {"error": str(e)}, 500
+
+@system_ns.route('/test-session-payload')  
+class TestSessionPayload(Resource):
+    @api.doc('test_session_payload')
+    def post(self):
+        """Test endpoint to debug session payload format"""
+        try:
+            data = request.get_json()
+            print(f"🔍 TEST DEBUG - Raw request data: {data}", flush=True)
+            
+            if not data:
+                return {"error": "No JSON data provided"}, 400
+                
+            properties = data.get('properties', {})
+            print(f"🔍 TEST DEBUG - Properties: {properties}", flush=True)
+            
+            code = properties.get('code', '')
+            print(f"🔍 TEST DEBUG - Code: {repr(code)} (len={len(code)})", flush=True)
+            
+            has_code = code and code.strip()
+            print(f"🔍 TEST DEBUG - has_code: {has_code}", flush=True)
+            
+            if not has_code:
+                return {"error": "No code provided"}, 400
+                
+            return {"success": True, "code_received": code, "length": len(code)}
+        except Exception as e:
+            print(f"🔍 TEST DEBUG - Exception: {e}", flush=True)
+            return {"error": str(e)}, 500
+
+@system_ns.route('/auth-config')
+class AuthConfig(Resource):
+    @api.doc('auth_config')
+    def get(self):
+        return {
+            "enabled": bool(CHAT_AUTH_CLIENT_ID and CHAT_AUTH_TENANT_ID and CHAT_AUTH_SCOPE),
+            "tenant_id": CHAT_AUTH_TENANT_ID,
+            "client_id": CHAT_AUTH_CLIENT_ID,
+            "audience": CHAT_AUTH_AUDIENCE,
+            "scope": CHAT_AUTH_SCOPE,
+            "platform_auth_enabled": TRUST_EASYAUTH_HEADERS
+        }
 
 @system_ns.route('/health')
 class Health(Resource):
@@ -1221,13 +1623,15 @@ class Tools(Resource):
 class SessionManager(Resource):
     @api.doc('clear_session')
     @api.response(200, 'Session cleared successfully')
-    def delete(self):
-        """Clear the caller's conversation and rotate its opaque session cookie."""
-        session_id = g.client_session_id
-        with conversation_threads_lock:
-            conversation_threads.pop(session_id, None)
-        g.clear_session_cookie = True
-        return {"message": "Session cleared"}
+    @api.response(401, 'Unauthorized', error_response_model)
+    @api.response(404, 'Session not found')
+    def delete(self, session_id):
+        """Clear conversation history for a specific session"""
+        if session_id in conversation_threads:
+            del conversation_threads[session_id]
+            return {"message": f"Session {session_id} cleared"}
+        else:
+            return {"message": f"Session {session_id} not found"}, 404
 
 if __name__ == "__main__":
     print("🚀 Starting Microsoft Agent Framework SmartAssistant")

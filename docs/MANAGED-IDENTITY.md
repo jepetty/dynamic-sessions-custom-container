@@ -137,7 +137,7 @@ The application uses these environment variables (no secrets required):
 ```bash
 # Azure OpenAI Configuration
 AZURE_OPENAI_ENDPOINT="https://<your-openai-name>.openai.azure.com/"
-AZURE_OPENAI_DEPLOYMENT="gpt-4o-mini"
+AZURE_OPENAI_DEPLOYMENT="gpt-5.6-sol"
 
 # Session Pool Configuration
 AZURE_CONTAINER_APPS_SESSION_POOL_ENDPOINT="https://<your-session-pool-name>.<environment-unique-id>.<region>.azurecontainerapps.io"

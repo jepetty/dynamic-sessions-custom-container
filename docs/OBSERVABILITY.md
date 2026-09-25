@@ -41,7 +41,7 @@ Use the "Start Agent Framework Server" task in VS Code (Terminal → Run Task)
 ```bash
 # Set environment variables (optional for demo mode)
 $env:AZURE_OPENAI_ENDPOINT = "https://your-resource.openai.azure.com/"
-$env:AZURE_OPENAI_DEPLOYMENT = "gpt-4o-mini"
+$env:AZURE_OPENAI_DEPLOYMENT = "gpt-5.6-sol"
 $env:SESSION_POOL_ENDPOINT = "https://your-session-pool.azurecontainerapps.io"
 $env:SESSION_POOL_AUDIENCE = "https://dynamicsessions.io/.default"
 
@@ -74,7 +74,7 @@ curl http://localhost:8080/api/system/health
   "status": "healthy",
   "azure_openai_configured": true,
   "session_pool_configured": true,
-  "model": "gpt-4o-mini",
+  "model": "gpt-5.6-sol",
   "timestamp": "2025-12-07T12:34:56.789Z"
 }
 ```
