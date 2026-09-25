@@ -203,6 +203,14 @@ python main.py
 - No hardcoded secrets in code
 - Credentials never leave Azure platform
 
+## Application Session Security
+
+Managed identity authenticates the application to Azure services; it does not authenticate people using the public web application. This sample generates a cryptographically signed, opaque `HttpOnly` cookie for each client and uses the verified identifier as the private conversation and Dynamic Session identifier. Clients cannot supply identifiers in request bodies, forge another client's identifier, enumerate execution state, or delete another client's conversation.
+
+Conversation threads are held in memory for sample simplicity, so the deployment is constrained to one application replica. Threads expire after inactivity and the collection is bounded. Use a shared state store with TTL support before enabling application scale-out or durable production conversations.
+
+The default gallery deployment remains anonymous for demonstration purposes. Enable Azure Container Apps authentication and authorization, restrict ingress, and add appropriate usage controls before deploying the sample with sensitive data or for production workloads.
+
 ## Role Assignments Required
 
 The managed identity needs these roles:

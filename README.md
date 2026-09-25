@@ -56,6 +56,7 @@ The application is a Flask-based web interface that leverages **Microsoft Agent 
 - **Interactive Web UI**: Modern chat interface with session tracking and code execution visualization
 - **Secure Isolated Execution**: Each code execution runs in a separate, secure Hyper-V isolated container
 - **Session Management**: Automatic lifecycle tracking with visual session status indicators
+- **Per-client Isolation**: Opaque, server-generated cookies keep conversation and execution state separate across clients
 
 ## Prerequisites
 
@@ -154,6 +155,10 @@ If you prefer manual configuration, set:
 - `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` (or `AZURE_OPENAI_DEPLOYMENT`)
 - `AZURE_CONTAINER_APPS_SESSION_POOL_ENDPOINT`
 - `SESSION_POOL_AUDIENCE` (defaults to `https://dynamicsessions.io/.default`)
+- `SESSION_COOKIE_SECURE` (defaults to `false` locally; the Bicep deployment sets it to `true`)
+- `SESSION_COOKIE_MAX_AGE_SECONDS` (defaults to 30 minutes)
+- `MAX_CONVERSATION_THREADS` (defaults to 100)
+- `SESSION_SIGNING_KEY` (optional; generated at process startup when omitted)
 
 ### 2b. Configure Chat Authentication (Recommended: Microsoft Entra)
 
@@ -306,10 +311,11 @@ curl -X POST "http://localhost:8080/api/chat/" \
 
 ```json
 {
-  "prompt": "Calculate the mean of [1, 2, 3, 4, 5]",
-  "session_id": "user_123"
+  "prompt": "Calculate the mean of [1, 2, 3, 4, 5]"
 }
 ```
+
+The server creates an opaque `HttpOnly` session cookie. API clients must retain the cookie between requests to preserve conversation and code-execution state.
 
 Response:
 
@@ -324,9 +330,20 @@ Response:
       "icon": "📦",
       "description": "Python Execution"
     }
-  ],
-  "session_id": "user_123"
+  ]
 }
+```
+
+For example, with curl:
+
+```bash
+curl -c cookies.txt -b cookies.txt \
+  -X POST http://localhost:8080/api/chat/ \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Calculate the mean of [1, 2, 3, 4, 5]"}'
+
+curl -c cookies.txt -b cookies.txt \
+  -X DELETE http://localhost:8080/api/chat/session
 ```
 
 ### Interactive Web Interface
@@ -335,7 +352,7 @@ The web interface demonstrates custom container sessions:
 
 - **Automatic Code Execution**: Math and calculation questions trigger Python code execution in custom containers
 - **Pre-installed Libraries**: Access numpy, pandas, matplotlib, and more without installation
-- **Session Tracking**: Visual indicators show active sessions and which tool was used
+- **Private Session Tracking**: Conversation and execution state is scoped to the caller's opaque cookie
 - **Code Visualization**: See the Python code that was executed and its output
 - **Session Persistence**: Follow-up questions maintain context within the same session
 
@@ -368,6 +385,12 @@ The web interface demonstrates custom container sessions:
 - **No credentials in code**: Uses Azure DefaultAzureCredential
 - **Role-based access**: Proper RBAC configuration for OpenAI and session pool access
 - **Container isolation**: Hyper-V isolation for secure code execution
+- **Server-controlled sessions**: Clients cannot choose conversation or Dynamic Session identifiers
+- **Same-origin browser access**: The template does not enable wildcard CORS
+
+> **Security scope:** The deployed sample is intentionally anonymous to preserve a simple gallery experience. The opaque cookie prevents cross-client state sharing, but it is not user authentication. Before using this sample with sensitive data or exposing it for production use, enable Azure Container Apps authentication and authorization, restrict ingress, and apply resource-usage controls.
+
+The sample uses one application replica because conversation threads are intentionally held in memory for simplicity. Cookies are cryptographically signed, threads expire after inactivity, and the in-memory collection is bounded. Production deployments that require scaling or durable conversations should move thread state to a shared store with TTL support.
 
 ## Project Structure
 
