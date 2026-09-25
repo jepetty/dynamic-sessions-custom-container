@@ -2,14 +2,16 @@ import os
 import asyncio
 import json
 import random
+import secrets
 import uuid
 import time
 import base64
 import threading
 import queue
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, send_file, Response, stream_with_context
+from contextvars import ContextVar
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context, g
 from flask_restx import Api, Resource, fields, Namespace
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from agent_framework import ChatAgent, AgentThread
 try:
     from agent_framework import ai_function
@@ -63,19 +65,16 @@ tools_ns = api.namespace('tools', description='AI tool management and discovery'
 
 # Define API models for request/response schemas
 chat_request_model = api.model('ChatRequest', {
-    'prompt': fields.String(required=True, description='The user message or question', example='Execute print("Hello World")'),
-    'session_id': fields.String(required=False, description='Session identifier for conversation continuity', example='user_123')
+    'prompt': fields.String(required=True, description='The user message or question', example='Execute print("Hello World")')
 })
 
 chat_response_model = api.model('ChatResponse', {
     'response': fields.String(required=True, description='AI agent response'),
-    'session_id': fields.String(required=True, description='Session identifier'),
     'agent': fields.String(required=True, description='Agent framework name'),
     'model': fields.String(required=True, description='AI model used'),
     'tools_used': fields.List(fields.Raw, description='List of tools that were used'),
     'tools_available': fields.List(fields.String, description='Available tools'),
-    'conversation_length': fields.Integer(description='Number of messages in conversation'),
-    'active_sessions': fields.Raw(description='Active dynamic sessions with execution details')
+    'conversation_length': fields.Integer(description='Number of messages in conversation')
 })
 
 health_response_model = api.model('HealthResponse', {
@@ -85,8 +84,6 @@ health_response_model = api.model('HealthResponse', {
     'endpoint': fields.String(description='Azure OpenAI endpoint'),
     'model': fields.String(description='AI model deployment'),
     'tools_count': fields.Integer(description='Number of available tools'),
-    'active_sessions': fields.Integer(description='Number of active chat sessions'),
-    'dynamic_sessions': fields.Integer(description='Number of active dynamic sessions'),
     'session_pool_configured': fields.Boolean(description='Whether Azure Container Apps session pool is configured'),
     'azure_configured': fields.Boolean(description='Whether Azure OpenAI is properly configured')
 })
@@ -120,19 +117,109 @@ SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID")
 RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP")
 SESSION_POOL_NAME = os.getenv("AZURE_SESSION_POOL_NAME", "dynamic-session-pool")
 SESSION_POOL_AUDIENCE = os.getenv("SESSION_POOL_AUDIENCE", "https://dynamicsessions.io/.default")
+SESSION_COOKIE_NAME = "aca_sample_session"
+SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+SESSION_COOKIE_MAX_AGE_SECONDS = int(os.getenv("SESSION_COOKIE_MAX_AGE_SECONDS", "1800"))
+MAX_CONVERSATION_THREADS = int(os.getenv("MAX_CONVERSATION_THREADS", "100"))
+SESSION_SIGNING_KEY = os.getenv("SESSION_SIGNING_KEY") or secrets.token_hex(32)
 
-# Session management storage
-active_sessions: Dict[str, Dict[str, Any]] = {}
+current_session_id: ContextVar[Optional[str]] = ContextVar("current_session_id", default=None)
+request_tools_used: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar("request_tools_used", default=None)
+session_serializer = URLSafeTimedSerializer(SESSION_SIGNING_KEY, salt="aca-sample-session")
+conversation_threads: Dict[str, Dict[str, Any]] = {}
+conversation_threads_lock = threading.Lock()
 
-# Track which session IDs have been used in current request to avoid duplicates
-current_request_sessions: set = set()
+
+def _get_request_tools() -> List[Dict[str, Any]]:
+    tools = request_tools_used.get()
+    if tools is None:
+        tools = []
+        request_tools_used.set(tools)
+    return tools
+
+
+def _decode_session_cookie(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        session_id = session_serializer.loads(
+            value,
+            max_age=SESSION_COOKIE_MAX_AGE_SECONDS,
+        )
+    except (BadSignature, SignatureExpired):
+        return None
+    if not isinstance(session_id, str) or len(session_id) != 32:
+        return None
+    return session_id
+
+
+def _cleanup_conversation_threads(now: float) -> None:
+    expired_before = now - SESSION_COOKIE_MAX_AGE_SECONDS
+    expired_ids = [
+        session_id
+        for session_id, state in conversation_threads.items()
+        if state["last_used"] < expired_before
+    ]
+    for session_id in expired_ids:
+        conversation_threads.pop(session_id, None)
+
+    overflow = len(conversation_threads) - MAX_CONVERSATION_THREADS
+    if overflow > 0:
+        oldest_ids = sorted(
+            conversation_threads,
+            key=lambda session_id: conversation_threads[session_id]["last_used"],
+        )[:overflow]
+        for session_id in oldest_ids:
+            conversation_threads.pop(session_id, None)
+
+
+def _get_conversation_thread(session_id: str):
+    now = time.monotonic()
+    with conversation_threads_lock:
+        _cleanup_conversation_threads(now)
+        state = conversation_threads.get(session_id)
+        if state is None:
+            state = {
+                "thread": agent.get_new_thread(),
+                "last_used": now,
+            }
+            conversation_threads[session_id] = state
+            _cleanup_conversation_threads(now)
+        else:
+            state["last_used"] = now
+        return state["thread"]
+
+
+@app.before_request
+def assign_client_session() -> None:
+    session_id = _decode_session_cookie(request.cookies.get(SESSION_COOKIE_NAME))
+    if session_id is None:
+        session_id = uuid.uuid4().hex
+        g.set_session_cookie = True
+    g.client_session_id = session_id
+
+
+@app.after_request
+def persist_client_session(response):
+    if getattr(g, "clear_session_cookie", False):
+        response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    elif getattr(g, "set_session_cookie", False):
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            session_serializer.dumps(g.client_session_id),
+            httponly=True,
+            secure=SESSION_COOKIE_SECURE,
+            samesite="Lax",
+            max_age=SESSION_COOKIE_MAX_AGE_SECONDS,
+            path="/",
+        )
+    return response
 
 # Enhanced AI functions (tools) for the agent
 @ai_function
 def search_tools_available() -> str:
     """List all available tools and their capabilities."""
-    global current_tools_used
-    current_tools_used.append({"name": "search_tools_available", "icon": "🔧", "description": "Tool discovery"})
+    _get_request_tools().append({"name": "search_tools_available", "icon": "🔧", "description": "Tool discovery"})
     print("🔧 TOOL CALLED: search_tools_available()")
     
     tools_info = """Available AI Tools:
@@ -163,7 +250,7 @@ def execute_in_dynamic_session(
     - execute_in_dynamic_session(code="print('hello world')")
     - execute_in_dynamic_session(code="x = 5\\nprint(x * 2)")
     """
-    # Always use Python and reuse existing sessions when available
+    # Always use Python and isolate execution state by the current client session.
     
     # Write debug info to file to see if function is called
     import os
@@ -175,26 +262,15 @@ def execute_in_dynamic_session(
         pass  # Ignore file write errors
     
     try:
-        # Reuse existing session if available, otherwise create new one
-        session_id = None
-        if active_sessions:
-            session_id = list(active_sessions.keys())[-1]
-            print(f"📦 Reusing existing session: {session_id}")
-        else:
-            session_id = uuid.uuid4().hex[:12]
-            print(f"📦 Creating new session: {session_id}")
-        
-        global current_tools_used, current_request_sessions
-        
-        # Only track if this session hasn't been used in current request
-        if session_id not in current_request_sessions:
-            current_tools_used.append({
-                "name": "execute_in_dynamic_session", 
-                "icon": "📦", 
-                "description": "Python Execution", 
-                "session_id": session_id
-            })
-            current_request_sessions.add(session_id)
+        session_id = current_session_id.get()
+        if not session_id:
+            return "Session error: No request session is available."
+
+        _get_request_tools().append({
+            "name": "execute_in_dynamic_session",
+            "icon": "📦",
+            "description": "Python Execution",
+        })
         print(f"📦 TOOL CALLED: execute_in_dynamic_session()")
         print(f"🔍 SESSION_POOL_ENDPOINT: {SESSION_POOL_ENDPOINT}")
         
@@ -256,12 +332,10 @@ def execute_in_dynamic_session(
         
         # Execute request
         
-        print(f"📦 Executing Python code in session {session_id[:8]}...")
-        print(f"🔗 Session URL: {session_url}")
+        print("📦 Executing Python code in the current client session...")
         print(f"📋 Payload: {execution_payload}")
         try:
-            print(f"🚀 Making request to: {session_url}")
-            print(f"📋 Headers: {headers}")
+            print("🚀 Making request to the configured session pool")
             print(f"📦 Payload: {execution_payload}")
             
             response = requests.post(session_url, json=execution_payload, headers=headers, timeout=60)
@@ -277,23 +351,10 @@ def execute_in_dynamic_session(
             print(f"📊 DEBUG: Full response from session container: {result}")
             print(f"📊 DEBUG: Full response JSON: {json.dumps(result, indent=2)}")
             
-            # Track auto-allocated session
-            if session_id not in active_sessions:
-                active_sessions[session_id] = {
-                    "created_at": datetime.now().isoformat(),
-                    "execution_count": 0,
-                    "last_stdout": "",
-                    "last_stderr": ""
-                }
-                print(f"✅ Session auto-allocated: {session_id}")
-            
-            # Update session statistics
-            active_sessions[session_id]["execution_count"] += 1
-            active_sessions[session_id]["last_used"] = datetime.now().isoformat()
-            
-            # Debug logging
-            print(f"📊 DEBUG: active_sessions dict has {len(active_sessions)} entries")
-            print(f"📊 DEBUG: active_sessions = {active_sessions}")
+            execution_state = {
+                "last_stdout": "",
+                "last_stderr": "",
+            }
             
             # Extract execution result and capture stdout/stderr
             # Handle both formats: properties-based (Azure) and direct fields (our container)
@@ -309,9 +370,9 @@ def execute_in_dynamic_session(
                 status = props.get("status", "")
                 return_code = props.get("returnCode", None)
                 
-                active_sessions[session_id]["last_stdout"] = stdout
-                active_sessions[session_id]["last_stderr"] = stderr
-                active_sessions[session_id]["last_returnCode"] = return_code
+                execution_state["last_stdout"] = stdout
+                execution_state["last_stderr"] = stderr
+                execution_state["last_returnCode"] = return_code
                 
                 # Determine if execution failed based on multiple signals
                 # Check for error indicators in stdout (Python errors often go to stdout)
@@ -322,20 +383,18 @@ def execute_in_dynamic_session(
                 
                 # If there's error content in stderr OR error patterns in stdout, mark as failed
                 if stderr or has_error_in_stdout or status == "Failed" or (return_code and return_code != 0):
-                    active_sessions[session_id]["last_status"] = "Failed"
+                    execution_state["last_status"] = "Failed"
                     # Move error from stdout to stderr if it contains error patterns
                     if has_error_in_stdout and not stderr:
-                        active_sessions[session_id]["last_stderr"] = stdout
-                        active_sessions[session_id]["last_stdout"] = ""
+                        execution_state["last_stderr"] = stdout
+                        execution_state["last_stdout"] = ""
                 else:
-                    active_sessions[session_id]["last_status"] = "Success"
+                    execution_state["last_status"] = "Success"
                 
                 print(f"📊 DEBUG: Raw props.stdout = {repr(stdout)}")
                 print(f"📊 DEBUG: Raw props.stderr = {repr(stderr)}")
                 print(f"📊 DEBUG: Status: '{status}', ReturnCode: {return_code}")
                 print(f"📊 DEBUG: Has error in stdout: {has_error_in_stdout}")
-                print(f"📊 DEBUG: Final active_sessions[{session_id}] = {active_sessions[session_id]}")
-                
                 # Extract the execution result - use stderr if present, otherwise stdout
                 execution_result = stderr if stderr else stdout
             else:
@@ -358,39 +417,36 @@ def execute_in_dynamic_session(
                 if stderr or has_error_in_stdout or not success or return_code != 0:
                     # Move error from stdout to stderr if needed
                     if has_error_in_stdout and not stderr:
-                        active_sessions[session_id]["last_stderr"] = stdout
-                        active_sessions[session_id]["last_stdout"] = ""
+                        execution_state["last_stderr"] = stdout
+                        execution_state["last_stdout"] = ""
                     else:
-                        active_sessions[session_id]["last_stdout"] = stdout
-                        active_sessions[session_id]["last_stderr"] = stderr
-                    active_sessions[session_id]["last_status"] = "Failed"
-                    active_sessions[session_id]["last_returnCode"] = return_code if return_code != 0 else 1
+                        execution_state["last_stdout"] = stdout
+                        execution_state["last_stderr"] = stderr
+                    execution_state["last_status"] = "Failed"
+                    execution_state["last_returnCode"] = return_code if return_code != 0 else 1
                 else:
-                    active_sessions[session_id]["last_stdout"] = stdout
-                    active_sessions[session_id]["last_stderr"] = stderr
-                    active_sessions[session_id]["last_status"] = "Success"
-                    active_sessions[session_id]["last_returnCode"] = return_code
+                    execution_state["last_stdout"] = stdout
+                    execution_state["last_stderr"] = stderr
+                    execution_state["last_status"] = "Success"
+                    execution_state["last_returnCode"] = return_code
                 
                 print(f"📊 DEBUG: Captured stdout: '{stdout}', stderr: '{stderr}'")
                 print(f"📊 DEBUG: Has error in stdout: {has_error_in_stdout}")
-                print(f"📊 DEBUG: Final Status: '{active_sessions[session_id]['last_status']}', ReturnCode: {active_sessions[session_id]['last_returnCode']}")
-                print(f"📊 DEBUG: active_sessions[{session_id}] = {active_sessions[session_id]}")
+                print(f"📊 DEBUG: Final Status: '{execution_state['last_status']}', ReturnCode: {execution_state['last_returnCode']}")
                 
                 # Use stderr if present, otherwise stdout
-                execution_result = active_sessions[session_id]["last_stderr"] if active_sessions[session_id]["last_stderr"] else active_sessions[session_id]["last_stdout"]
+                execution_result = execution_state["last_stderr"] if execution_state["last_stderr"] else execution_state["last_stdout"]
             
-            # Check if execution was successful or failed (use updated values from active_sessions)
-            return_code = active_sessions[session_id].get("last_returnCode", 0)
-            status = active_sessions[session_id].get("last_status", "Success")
-            stderr = active_sessions[session_id].get("last_stderr", "")
-            stdout = active_sessions[session_id].get("last_stdout", "")
+            return_code = execution_state.get("last_returnCode", 0)
+            status = execution_state.get("last_status", "Success")
+            stderr = execution_state.get("last_stderr", "")
+            stdout = execution_state.get("last_stdout", "")
             
             # Format output with clear visual separation
             if status == "Failed" or return_code != 0 or stderr:
                 # Execution failed
                 formatted_output = f"""❌ **Code Execution Failed**
 
-**Session ID:** {session_id[:12]}...
 **Return Code:** {return_code}
 
 **Code Executed:**
@@ -407,8 +463,6 @@ def execute_in_dynamic_session(
             else:
                 # Execution successful
                 formatted_output = f"""✅ **Code Execution Successful**
-
-**Session ID:** {session_id[:12]}...
 
 **Code Executed:**
 ```python
@@ -485,7 +539,7 @@ Available capabilities:
 For mathematical calculations:
 - CRITICAL: When a user asks for ANY mathematical calculation (addition, subtraction, multiplication, division, etc.), you MUST use execute_in_dynamic_session() to run Python code
 - DO NOT just write out the math in text format - ALWAYS execute it as Python code
-- DO NOT repeat the calculation result in your text response using LaTeX notation like \(5 \times 10\) or mathematical symbols
+- DO NOT repeat the calculation result in your text response using LaTeX notation like \\(5 \\times 10\\) or mathematical symbols
 - After executing the code, the result will be shown automatically in the formatted output - just provide a brief acknowledgment
 - Example: If asked "what's 5 times 10", call execute_in_dynamic_session(code="result = 5 * 10\nprint(result)") and respond with "I've calculated that for you." or "Here's the result:"
 
@@ -525,12 +579,6 @@ else:
     print("🔧 Set AZURE_OPENAI_ENDPOINT environment variable to use Azure OpenAI")
     print("🔧 Running in demo mode for now")
 
-
-# Global thread storage for conversation continuity
-conversation_threads = {}
-
-# Global tool usage tracking
-current_tools_used = []
 
 @app.route("/", methods=["GET"])
 def index():
@@ -840,13 +888,6 @@ def index():
             <button id="sendButton" class="send-button" onclick="sendMessage()">Send</button>
         </div>
     </div>
-    
-    <div class="session-panel">
-        <h3>📦 Active Sessions</h3>
-        <div id="sessionList">
-            <div class="no-sessions">No active sessions</div>
-        </div>
-    </div>
     </div>
 
     <script>
@@ -863,8 +904,8 @@ def index():
             if (!isUser) {
                 // Process code blocks and bold text for bot messages
                 let formatted = text
-                    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-                    .replace(/```([\s\S]*?)```/g, '<pre>$1</pre>')
+                    .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+                    .replace(/```([\\s\\S]*?)```/g, '<pre>$1</pre>')
                     .replace(/`([^`]+)`/g, '<code>$1</code>');
                 messageContent.innerHTML = formatted;
             } else {
@@ -929,8 +970,7 @@ def index():
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        prompt: message,
-                        session_id: 'web_chat'
+                        prompt: message
                     })
                 });
 
@@ -945,8 +985,6 @@ def index():
                         false,
                         data.tools_used || null
                     );
-                    console.log('🔄 Calling updateSessionPanel with:', data.active_sessions);
-                    updateSessionPanel(data.active_sessions || {});
                 }
             } catch (error) {
                 addMessage(`❌ Connection error: ${error.message}`);
@@ -958,47 +996,6 @@ def index():
                 messageInput.focus();
             }
         }
-
-        function updateSessionPanel(sessions) {
-            const sessionList = document.getElementById('sessionList');
-            console.log('📊 Updating session panel:', sessions);
-            
-            if (!sessions || Object.keys(sessions).length === 0) {
-                console.log('⚠️ No sessions to display');
-                sessionList.innerHTML = '<div class="no-sessions">No active sessions</div>';
-                return;
-            }
-            
-            console.log('✅ Found', Object.keys(sessions).length, 'sessions');
-            let html = '';
-            for (const [sessionId, sessionData] of Object.entries(sessions)) {
-                const shortId = sessionId.substring(0, 16);
-                console.log('  📝 Session:', shortId, sessionData);
-                const jsonData = JSON.stringify(sessionData, null, 2);
-                
-                // Format session data with better readability
-                html += `
-                    <div class="session-item">
-                        <div class="session-header">🔹 Session ID: ${shortId}...</div>
-                        <div class="session-details">
-                            <div><strong>Executions:</strong> ${sessionData.execution_count || 0}</div>
-                            <div><strong>Created:</strong> ${new Date(sessionData.created_at).toLocaleTimeString()}</div>
-                            ${sessionData.last_used ? `<div><strong>Last Used:</strong> ${new Date(sessionData.last_used).toLocaleTimeString()}</div>` : ''}
-                            ${sessionData.last_status ? `<div><strong>Status:</strong> ${sessionData.last_status}</div>` : ''}
-                            ${sessionData.last_returnCode !== undefined ? `<div><strong>Return Code:</strong> ${sessionData.last_returnCode}</div>` : ''}
-                            ${sessionData.last_stdout ? `<div class="output-section"><strong>stdout:</strong><pre>${sessionData.last_stdout}</pre></div>` : ''}
-                            ${sessionData.last_stderr ? `<div class="error-section"><strong>stderr:</strong><pre>${sessionData.last_stderr}</pre></div>` : ''}
-                        </div>
-                        <details class="session-json-toggle">
-                            <summary>View Raw JSON</summary>
-                            <pre class="session-json">${jsonData}</pre>
-                        </details>
-                    </div>
-                `;
-            }
-            sessionList.innerHTML = html;
-        }
-        
 
         // Focus input on load
         messageInput.focus();
@@ -1016,11 +1013,13 @@ class Chat(Resource):
     @api.response(500, 'Internal Server Error', error_response_model)
     def post(self):
         """Send a message to the AI agent and get a response with automatic tool selection"""
-        data = request.json
-        prompt = data.get("prompt", "")
-        session_id = data.get("session_id", "default")
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return {"error": "A JSON object is required"}, 400
+        prompt = data.get("prompt")
+        session_id = g.client_session_id
         
-        if not prompt:
+        if not isinstance(prompt, str) or not prompt.strip():
             return {"error": "No prompt provided"}, 400
         
         try:
@@ -1029,32 +1028,30 @@ class Chat(Resource):
                     "error": "Azure OpenAI configuration required. Please set AZURE_OPENAI_ENDPOINT environment variable and ensure proper authentication."
                 }, 500
             
-            print(f"\n🚀 NEW REQUEST (Session: {session_id})")
+            print("\n🚀 NEW REQUEST")
             print(f"📝 User Input: {prompt}")
             print("🤖 Agent analyzing request and selecting appropriate tools...")
             
-            # Get or create conversation thread for session continuity
-            if session_id not in conversation_threads:
-                conversation_threads[session_id] = agent.get_new_thread()
+            thread = _get_conversation_thread(session_id)
             
-            thread = conversation_threads[session_id]
-            
-            # Reset tool usage tracking for this request
-            global current_tools_used, current_request_sessions
-            current_tools_used = []
-            current_request_sessions = set()
-            print(f"🔧 DEBUG: Reset current_tools_used and session tracking, starting fresh for this request")
+            tools_used = []
+            session_token = current_session_id.set(session_id)
+            tools_token = request_tools_used.set(tools_used)
             
             # Run the agent asynchronously with conversation thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            print(f"🤖 DEBUG: About to call agent.run() with prompt: {prompt[:50]}...")
-            result = loop.run_until_complete(agent.run(prompt, thread=thread))
-            loop.close()
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                print(f"🤖 DEBUG: About to call agent.run() with prompt: {prompt[:50]}...")
+                try:
+                    result = loop.run_until_complete(agent.run(prompt, thread=thread))
+                finally:
+                    loop.close()
+            finally:
+                current_session_id.reset(session_token)
+                request_tools_used.reset(tools_token)
             print(f"🤖 DEBUG: agent.run() completed")
             
-            # Get the tools that were used during this request
-            tools_used = current_tools_used.copy()
             print(f"🔧 DEBUG: Tools used during this request: {tools_used}")
             
             print(f"✅ Agent Response Generated")
@@ -1064,13 +1061,6 @@ class Chat(Resource):
             else:
                 print(f"⚠️ WARNING: No tools were used for this request!")
             
-            import copy
-            sessions_copy = copy.deepcopy(active_sessions)
-            print(f"📊 Active Sessions Count: {len(sessions_copy)}")
-            print(f"📊 DEBUG: sessions_copy = {sessions_copy}")
-            if sessions_copy:
-                print(f"📊 Session IDs: {list(sessions_copy.keys())}")
-            
             # Build tools_available list based on what's actually registered
             tools_available = ["search_tools_available"]
             if SESSION_POOL_ENDPOINT:
@@ -1078,15 +1068,12 @@ class Chat(Resource):
             
             response_data = {
                 "response": result.text,
-                "session_id": session_id,
                 "agent": "Microsoft Agent Framework SmartAssistant",
                 "model": AZURE_OPENAI_DEPLOYMENT,
                 "tools_used": tools_used,
                 "tools_available": tools_available,
-                "conversation_length": len(thread.messages) if hasattr(thread, 'messages') else 0,
-                "active_sessions": sessions_copy if sessions_copy else None
+                "conversation_length": len(thread.messages) if hasattr(thread, 'messages') else 0
             }
-            print(f"📊 DEBUG: Returning response with active_sessions = {response_data.get('active_sessions')}")
             return response_data
         except Exception as e:
             print(f"❌ Error: {str(e)}")
@@ -1101,27 +1088,27 @@ class ChatStream(Resource):
     @api.response(500, 'Internal Server Error', error_response_model)
     def post(self):
         """Stream responses from the AI agent in real-time (experimental)"""
-        data = request.json
-        prompt = data.get("prompt", "")
-        session_id = data.get("session_id", "default")
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return {"error": "A JSON object is required"}, 400
+        prompt = data.get("prompt")
+        session_id = g.client_session_id
         
-        if not prompt:
+        if not isinstance(prompt, str) or not prompt.strip():
             return {"error": "No prompt provided"}, 400
         
         try:
-            print(f"\n🚀 STREAMING REQUEST (Session: {session_id})")
+            print("\n🚀 STREAMING REQUEST")
             print(f"📝 User Input: {prompt}")
             
-            # Get or create conversation thread
-            if session_id not in conversation_threads:
-                conversation_threads[session_id] = agent.get_new_thread()
-            
-            thread = conversation_threads[session_id]
+            thread = _get_conversation_thread(session_id)
             
             def stream_generator():
                 q = queue.Queue()
                 
                 def run_async_stream():
+                    session_token = current_session_id.set(session_id)
+                    tools_token = request_tools_used.set([])
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
 
@@ -1135,8 +1122,12 @@ class ChatStream(Resource):
                         except Exception as stream_error:
                             q.put(("error", str(stream_error)))
 
-                    loop.run_until_complete(collect_stream())
-                    loop.close()
+                    try:
+                        loop.run_until_complete(collect_stream())
+                    finally:
+                        loop.close()
+                        current_session_id.reset(session_token)
+                        request_tools_used.reset(tools_token)
 
                 threading.Thread(target=run_async_stream, daemon=True).start()
 
@@ -1152,12 +1143,12 @@ class ChatStream(Resource):
                         continue
 
                     if kind == "data" and payload is not None:
-                        yield f"data: {json.dumps({'text': payload, 'session_id': session_id})}\n\n"
+                        yield f"data: {json.dumps({'text': payload})}\n\n"
                     elif kind == "error" and payload is not None:
-                        yield f"event: error\ndata: {json.dumps({'error': payload, 'session_id': session_id})}\n\n"
+                        yield f"event: error\ndata: {json.dumps({'error': payload})}\n\n"
                         break
                     elif kind == "done":
-                        yield f"event: done\ndata: {json.dumps({'session_id': session_id})}\n\n"
+                        yield "event: done\ndata: {}\n\n"
                         break
 
                 print(f"\n✅ Streaming Complete")
@@ -1172,35 +1163,6 @@ class ChatStream(Resource):
             )
         except Exception as e:
             print(f"❌ Streaming Error: {str(e)}")
-            return {"error": str(e)}, 500
-
-@system_ns.route('/test-session-payload')  
-class TestSessionPayload(Resource):
-    @api.doc('test_session_payload')
-    def post(self):
-        """Test endpoint to debug session payload format"""
-        try:
-            data = request.get_json()
-            print(f"🔍 TEST DEBUG - Raw request data: {data}", flush=True)
-            
-            if not data:
-                return {"error": "No JSON data provided"}, 400
-                
-            properties = data.get('properties', {})
-            print(f"🔍 TEST DEBUG - Properties: {properties}", flush=True)
-            
-            code = properties.get('code', '')
-            print(f"🔍 TEST DEBUG - Code: {repr(code)} (len={len(code)})", flush=True)
-            
-            has_code = code and code.strip()
-            print(f"🔍 TEST DEBUG - has_code: {has_code}", flush=True)
-            
-            if not has_code:
-                return {"error": "No code provided"}, 400
-                
-            return {"success": True, "code_received": code, "length": len(code)}
-        except Exception as e:
-            print(f"🔍 TEST DEBUG - Exception: {e}", flush=True)
             return {"error": str(e)}, 500
 
 @system_ns.route('/health')
@@ -1226,8 +1188,6 @@ class Health(Resource):
             "endpoint": AZURE_OPENAI_ENDPOINT,
             "model": AZURE_OPENAI_DEPLOYMENT,
             "tools_count": 3,
-            "active_sessions": len(conversation_threads),
-            "dynamic_sessions": len(active_sessions),
             "session_pool_configured": bool(SESSION_POOL_ENDPOINT),
             "azure_configured": True
         }
@@ -1257,18 +1217,17 @@ class Tools(Resource):
             "framework": "Microsoft Agent Framework"
         }
 
-@chat_ns.route('/sessions/<string:session_id>')
+@chat_ns.route('/session')
 class SessionManager(Resource):
     @api.doc('clear_session')
     @api.response(200, 'Session cleared successfully')
-    @api.response(404, 'Session not found')
-    def delete(self, session_id):
-        """Clear conversation history for a specific session"""
-        if session_id in conversation_threads:
-            del conversation_threads[session_id]
-            return {"message": f"Session {session_id} cleared"}
-        else:
-            return {"message": f"Session {session_id} not found"}, 404
+    def delete(self):
+        """Clear the caller's conversation and rotate its opaque session cookie."""
+        session_id = g.client_session_id
+        with conversation_threads_lock:
+            conversation_threads.pop(session_id, None)
+        g.clear_session_cookie = True
+        return {"message": "Session cleared"}
 
 if __name__ == "__main__":
     print("🚀 Starting Microsoft Agent Framework SmartAssistant")
@@ -1277,13 +1236,12 @@ if __name__ == "__main__":
     print("🔧 Available Tools:")
     print("   🔧 search_tools_available - Tool discovery")
     print("   📦 execute_in_dynamic_session - Secure code execution")
-    print(f"📊 Dynamic Sessions: {len(active_sessions)} active")
     print(f"🔗 Python Pool: {'Configured' if SESSION_POOL_ENDPOINT else 'Not configured'}")
     print("\n📋 Endpoints:")
     print("   POST /chat - Main chat interface")
     print("   POST /chat/stream - Streaming responses")
     print("   GET /tools - List available tools")
     print("   GET /health - Health check")
-    print("   DELETE /sessions/<id> - Clear session")
+    print("   DELETE /api/chat/session - Clear the current client session")
     print("\n🎯 The agent will automatically select appropriate tools based on your requests!")
     app.run(host="0.0.0.0", port=8080)
